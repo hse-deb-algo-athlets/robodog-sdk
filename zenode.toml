@@ -1,0 +1,14 @@
+# Deployment this repo's examples and tests talk to.
+#
+# Without this file zenode falls back to its defaults — peer mode with
+# multicast discovery and an empty namespace — which fails twice over against a
+# router-based stack: the keys resolve without the `robodog/` prefix, and
+# multicast scouting (UDP 7446) is commonly blocked by a host firewall.
+#
+# Override per shell with ZENODE_CONFIG, or per field with
+# ZENODE_TRANSPORT__NAMESPACE / ZENODE_TRANSPORT__CONNECT.
+
+[transport]
+mode = "client"
+connect = ["tcp/127.0.0.1:7447"]
+namespace = "robodog"
