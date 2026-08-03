@@ -1,0 +1,89 @@
+[project]
+name = "robodog-sdk"
+version = "0.1.0"
+description = "Wire contract and client for the Robodog Zenoh control system"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Fabian Bahr", email = "61473429+fabian-bxr@users.noreply.github.com" }]
+keywords = ["zenoh", "robotics", "unitree", "go2", "quadruped", "zenode"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+    "Framework :: AsyncIO",
+    "Typing :: Typed",
+]
+# Two dependencies, deliberately. Anything that needs a third (opencv, numpy,
+# mujoco, pyserial) is a node and belongs in robodog-stack, not here — see
+# ADR-010. Optional extras are the escape hatch for external wire formats.
+dependencies = [
+    "zenode>=0.1",
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+# CDR point-cloud decode for the externally-produced `livox/lidar` topic.
+# Not core: a student writing a velocity node should not pay for rosbags.
+livox = ["rosbags>=0.11.3", "numpy>=2.0"]
+
+[project.urls]
+Homepage = "https://github.com/hse-deb-algo-athlets/robodog-sdk"
+Repository = "https://github.com/hse-deb-algo-athlets/robodog-sdk"
+Issues = "https://github.com/hse-deb-algo-athlets/robodog-sdk/issues"
+
+[build-system]
+requires = ["uv_build>=0.8.4,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+# Development only. `--no-sources` (the Docker build) falls back to the
+# PEP 508 requirement above, so pin a tag there once zenode is published.
+zenode = { git = "https://github.com/hse-deb-algo-athlets/zenode.git" }
+
+[tool.uv]
+default-groups = ["dev"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+    "pytest-asyncio>=1.1",
+    "pyright>=1.1.410",
+    "ruff>=0.12",
+    "pre-commit>=4.6.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = ["--strict-markers", "--strict-config"]
+markers = [
+    "integration: exercises a real in-process zenoh session (slower)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM", "RUF", "G", "LOG", "ANN"]
+ignore = ["ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN"]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+# Examples are included: people copy them, so they are held to the same bar.
+include = ["src", "tests", "examples"]
+extraPaths = ["examples"]
