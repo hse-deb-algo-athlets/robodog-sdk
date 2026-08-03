@@ -28,22 +28,30 @@ Semantic versioning; `0.x` minor versions may move keys.
 
 ### Changed from `src/interfaces` — wire-visible
 
-These are breaking against the stack as it stands today. Each is deliberate;
-none can be deferred past the first release, because a key that moves later
-breaks a cohort mid-semester rather than nobody.
+The key scheme was restructured in the stack first (ADR-010 step 1); this
+package mirrors it. The `robodog/` prefix had come to mean nothing — introduced
+for "data from the robot", it ended up on commands, navigation and diagnostics
+too — so it becomes the deployment namespace, and the first segment of a key
+now names the *kind* of thing it carries.
 
-- **Keys are relative.** The `robodog/` prefix comes from
-  `[transport] namespace` at runtime instead of being baked into every string.
-- **Namespace inconsistencies normalized.** `nav/*`, `nodes/*` and
-  `lidar_odometry/pose` escaped the prefix; they are now namespaced like
-  everything else. Exception: `livox/lidar` and `lidar_odometry/pose` stay
-  absolute where an external producer owns the key.
+- **Keys are relative.** `[transport] namespace` is applied at runtime.
 - **`system_state/*` → `state/*`.**
-- **Movement lanes added.** `command/motion/move` is now the arbiter's *output*
-  and the robot bridge's only input. Producers publish to
+- **`nav/*` and `nodes/*` come under the namespace.** Outside it they cannot be
+  isolated per deployment: two simulations on one network would share them.
+- **`nodes/joy` → `input/gamepad`**, `nodes/controller_status` →
+  `input/gamepad/status`. `node/` is reserved for zenode's presence, health,
+  log and trace keys.
+- **`command/motion/estop` → `safety/estop`**, and `nav/protective_field` →
+  `safety/protective_field`, so the whole safety path sits under one prefix.
+- **`sensors/realsense/*` → `sensors/d435i/*`**, and `sensors/go2_camera` →
+  `sensors/go2/camera`: device first, then stream, so a second camera does not
+  require renaming the first.
+- **`system_state/agv_state` → `vda5050/state`**, owned by the MQTT bridge.
+- **Movement lanes added.** `command/motion/move` becomes the arbiter's output
+  and the robot bridge's only input; producers publish to
   `command/motion/move/{teleop,nav,agent}`.
-- **Movement commands expire** (`max_age = 0.3 s`) — this replaces the bridge's
-  `movement-max-delay-ms` and is the deadman.
+- **Movement commands expire** (`max_age = 0.3 s`), replacing the bridge's
+  `movement-max-delay-ms` and serving as the deadman.
 - **State topics are latched**, replacing three hand-rolled `session.get()`
   startup pulls in the stack.
 - **Velocities and tilt are bounded.** Values the old schemas accepted now
@@ -52,6 +60,12 @@ breaks a cohort mid-semester rather than nobody.
 - **`MovementCommand.scale()` validates.** It used `model_copy(update=…)`,
   which skips validation in Pydantic v2 — a scaled command could leave the
   envelope silently, which is exactly what `joy`'s speed factor does.
+- **MOLA's ROS 2 output is not in the contract.** `lidar_odometry/pose` is
+  CDR-encoded `PoseStamped` bridged from the MOLA container, not an
+  `OdometryState`. The fused pose has one key, `localization/pose`, with one
+  producer at a time.
+- **`ConnectionStatus` removed.** Nothing publishes it; a contract should not
+  ship a type that describes nothing on the wire.
 
 ### Not yet ported
 

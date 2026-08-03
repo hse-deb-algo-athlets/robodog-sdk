@@ -1,14 +1,15 @@
 """Payload schemas for every topic in the contract.
 
 Ported from ``robodog-digipro:src/interfaces``. Not yet ported, and tracked in
-the CHANGELOG: ``camera.py`` / ``image.py`` (JPEG frame envelopes),
-``controller.py`` (gamepad state), and ``livox.py`` (CDR point clouds, which
-land in ``robodog_sdk.contrib`` behind the ``[livox]`` extra rather than here).
+the CHANGELOG: ``camera.py`` / ``image.py`` (JPEG frame envelopes) and
+``livox.py`` (CDR point clouds, which land in ``robodog_sdk.contrib`` behind the
+``[livox]`` extra rather than here).
 """
 
 from __future__ import annotations
 
 from .control import ArbiterStatus, ControlGrant, ControlRelease, ControlRequest, Lane
+from .input import AnalogInput, Axis, Buttons, GamepadState, GamepadStatus
 from .motion import (
     ActionCommand,
     ActionType,
@@ -36,7 +37,6 @@ from .robot import (
     BatteryLevel,
     BatteryState,
     CommandedStance,
-    ConnectionStatus,
     IMUState,
     MotorState,
     OdometryState,
@@ -46,17 +46,21 @@ from .robot import (
 __all__ = [
     "ActionCommand",
     "ActionType",
+    "AnalogInput",
     "ArbiterStatus",
+    "Axis",
     "BatteryLevel",
     "BatteryState",
+    "Buttons",
     "CommandedStance",
-    "ConnectionStatus",
     "ControlGrant",
     "ControlRelease",
     "ControlRequest",
     "Corridor",
     "EmergencyStop",
     "EmergencyStopCommand",
+    "GamepadState",
+    "GamepadStatus",
     "IMUState",
     "Lane",
     "MotorState",

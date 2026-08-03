@@ -13,8 +13,8 @@ import contract_drive
 import pytest
 from zenode.testing import harness
 
-from robodog_sdk import NavTopics, ProtectiveFieldEvent
-from robodog_sdk.testing import FakeStack
+from robodog_sdk import NavTopics, ProtectiveFieldEvent, SafetyTopics
+from robodog_sdk.testing import FakeArbiter, FakeStack
 
 pytestmark = pytest.mark.integration
 
@@ -46,7 +46,7 @@ async def test_contract_drive_stops_on_protective_field() -> None:
             contract_drive.ContractDrive,
             config=contract_drive.DriveConfig(speed=0.3, distance=100.0, rate_hz=50.0),
         )
-        field = h.publisher(NavTopics.protective_field)
+        field = h.publisher(SafetyTopics.protective_field)
 
         stack.set_pose(x=0.0, y=0.0)
         await asyncio.sleep(SETTLE)
@@ -60,6 +60,7 @@ async def test_contract_drive_stops_on_protective_field() -> None:
 async def test_client_drive_takes_the_lane_and_stops() -> None:
     async with harness() as h:
         stack = await h.start_node(FakeStack)
+        arbiter = await h.start_node(FakeArbiter)
         await h.start_node(
             client_drive.ClientDrive,
             config=client_drive.DriveConfig(speed=0.3, distance=1.0),
@@ -67,7 +68,7 @@ async def test_client_drive_takes_the_lane_and_stops() -> None:
 
         stack.set_pose(x=0.0, y=0.0)
         await asyncio.sleep(SETTLE)
-        assert stack.granted, "client_drive should acquire the agent lane"
+        assert arbiter.granted, "client_drive should acquire the agent lane"
         assert stack.last_command is not None
         assert stack.last_command.x == pytest.approx(0.3)
 
@@ -81,6 +82,7 @@ async def test_both_examples_publish_on_the_agent_lane() -> None:
     async with harness() as h:
         stack = await h.start_node(FakeStack)
         arbiter_output = h.collect(NavTopics.request)  # unrelated key: stays empty
+        await h.start_node(FakeArbiter)
         await h.start_node(
             client_drive.ClientDrive, config=client_drive.DriveConfig(speed=0.2, distance=100.0)
         )

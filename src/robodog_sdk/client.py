@@ -41,8 +41,16 @@ from .msgs.navigation import (
     NavigationStatus,
     Pose2D,
 )
-from .msgs.robot import BatteryState, ConnectionStatus, OdometryState, RobotHighState
-from .topics import ControlServices, ControlTopics, MotionTopics, NavTopics, PoseTopics, StateTopics
+from .msgs.robot import BatteryState, OdometryState, RobotHighState
+from .topics import (
+    ControlServices,
+    ControlTopics,
+    MotionTopics,
+    NavTopics,
+    PoseTopics,
+    SafetyTopics,
+    StateTopics,
+)
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -99,7 +107,6 @@ class StateView:
         self.localization: Latest[OdometryState] = Latest()
         self.battery: Latest[BatteryState] = Latest()
         self.highstate: Latest[RobotHighState] = Latest()
-        self.connection: Latest[ConnectionStatus] = Latest()
         self.nav: Latest[NavigationStatus] = Latest()
 
 
@@ -133,7 +140,7 @@ class RobotClient:
         self.state = StateView()
 
         self._move = node.publisher(MotionTopics.move_agent)
-        self._estop = node.publisher(MotionTopics.estop)
+        self._estop = node.publisher(SafetyTopics.estop)
         self._action = node.publisher(PoseTopics.action)
         self._tilt = node.publisher(PoseTopics.tilt_body)
         self._nav_request = node.publisher(NavTopics.request)
@@ -143,7 +150,6 @@ class RobotClient:
         node.subscribe(StateTopics.odometry, self.state.odometry.update, mode="latest")
         node.subscribe(StateTopics.battery, self.state.battery.update, mode="latest")
         node.subscribe(StateTopics.highstate, self.state.highstate.update, mode="latest")
-        node.subscribe(StateTopics.connection, self.state.connection.update, mode="latest")
         node.subscribe(NavTopics.status, self._on_nav_status, mode="latest")
 
         self._nav_waiters: dict[str, asyncio.Future[NavigationState]] = {}

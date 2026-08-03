@@ -115,9 +115,17 @@ arbiter ranks below teleoperation and the e-stop. Take the lane explicitly with
 **Nothing may release an e-stop.** `robot.emergency_stop()` exists;
 there is no counterpart. Clearing a stop happens at the physical button.
 
-**Namespaces isolate you.** `[transport] namespace` prefixes every key, so six
-teams share one LAN without colliding. If your node sees no data, this is the
-first thing to check — `uv run zenode doctor` will say so.
+**The namespace must match the deployment.** Keys in the contract are relative;
+`[transport] namespace` is prefixed at runtime, so `state/odometry` becomes
+`robodog/state/odometry`. Everything talking to one robot uses that robot's
+namespace — set it to anything else and you will see no data at all, with no
+error. It is the first thing to check when nothing arrives, and
+`uv run zenode nodes` shows whether you are looking in the right place.
+
+A namespace separates *deployments*, not users. Your own simulation can run
+under `robodog/team-03` in complete isolation; against the shared robot you use
+its namespace like everyone else, and the arbiter — not the namespace — decides
+who drives.
 
 ## Tracing
 

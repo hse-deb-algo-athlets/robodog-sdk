@@ -22,6 +22,7 @@ from __future__ import annotations
 from zenode import Service, Topic, TopicSet
 
 from .msgs.control import ArbiterStatus, ControlGrant, ControlRelease, ControlRequest
+from .msgs.input import GamepadState, GamepadStatus
 from .msgs.motion import ActionCommand, EmergencyStopCommand, MovementCommand, TiltBody
 from .msgs.navigation import (
     NavigationCancel,
@@ -30,13 +31,7 @@ from .msgs.navigation import (
     PlannedPath,
     ProtectiveFieldEvent,
 )
-from .msgs.robot import (
-    BatteryState,
-    ConnectionStatus,
-    MotorState,
-    OdometryState,
-    RobotHighState,
-)
+from .msgs.robot import BatteryState, MotorState, OdometryState, RobotHighState
 
 #: Fraction of traces recorded as spans when one starts on a continuous
 #: stream. Unsampled traces still carry a trace id, so ``zenode logs --trace``
@@ -60,7 +55,8 @@ class MotionTopics(TopicSet):
     bypasses arbitration and is reserved for the arbiter itself.
 
     No lane is a trace root: a command is always caused by something upstream,
-    and starting a trace here would sever it from that cause.
+    and starting a trace here would sever it from that cause. The emergency
+    stop lives in :class:`SafetyTopics`.
     """
 
     move = Topic(
@@ -76,12 +72,6 @@ class MotionTopics(TopicSet):
         MovementCommand,
         max_age=COMMAND_MAX_AGE,
         description="Lane for nodes outside the stack — student projects publish here",
-    )
-    estop = Topic(
-        "command/motion/estop",
-        EmergencyStopCommand,
-        latched=True,
-        description="Latched: a node joining mid-stop learns it is stopped",
     )
 
 
@@ -108,11 +98,47 @@ class ControlServices(TopicSet):
     )
 
 
+class SafetyTopics(TopicSet):
+    """The safety path, in one prefix so it can be audited at a glance.
+
+    ``zenode echo 'safety/**'`` shows the whole of it. See ADR-002, ADR-004 and
+    ADR-005 in the robodog-digipro repository.
+    """
+
+    estop = Topic(
+        "safety/estop",
+        EmergencyStopCommand,
+        latched=True,
+        description="Latched: a node joining mid-stop learns that it is stopped",
+    )
+    protective_field = Topic(
+        "safety/protective_field",
+        ProtectiveFieldEvent,
+        latched=True,
+        description="Edge-triggered: one message on breach, one when clear",
+    )
+    # TODO(port): safety/release_button. The ESP32 publishes an untyped JSON
+    # blob and its only consumer treats any message as a trigger without
+    # inspecting it, so there is no schema to declare yet.
+
+
+class InputTopics(TopicSet):
+    """Human input devices.
+
+    Under ``input/`` rather than ``node/``, which zenode reserves for presence,
+    health, log and trace keys.
+    """
+
+    gamepad = Topic("input/gamepad", GamepadState)
+    gamepad_status = Topic("input/gamepad/status", GamepadStatus, latched=True)
+
+
 class StateTopics(TopicSet):
     """Robot state, published by the Go2 bridge or the simulation.
 
     All latched: a subscriber joining late receives the current value rather
     than waiting for the next update.
+
     """
 
     highstate = Topic("state/highstate", RobotHighState, latched=True)
@@ -126,11 +152,21 @@ class StateTopics(TopicSet):
     )
     battery = Topic("state/battery", BatteryState, latched=True)
     motor = Topic("state/motor", MotorState, latched=True)
-    connection = Topic("state/connection", ConnectionStatus, latched=True)
 
 
 class LocalizationTopics(TopicSet):
-    """Fused pose, from the MOLA SLAM stack or the odometry fallback node."""
+    """The robot's fused pose.
+
+    One key, and exactly one producer at a time: either the MOLA SLAM stack or
+    the odometry fallback node, never both (ADR-003). Consumers do not need to
+    know which is running.
+
+    MOLA's own ROS 2 output — ``lidar_odometry/pose`` and
+    ``lidar_odometry/pose_quality``, CDR-encoded ``PoseStamped`` bridged by
+    ``zenoh-bridge-ros2dds`` — is not part of this contract. It is internal to
+    that container, carries a different wire format, and is not what a
+    consumer of the robot's pose should subscribe to.
+    """
 
     pose = Topic(
         "localization/pose",
@@ -138,11 +174,8 @@ class LocalizationTopics(TopicSet):
         latched=True,
         trace=True,
         trace_ratio=TRACE_RATIO,
-        description="Trace root: MOLA is not a zenode node, so no context arrives with it",
+        description="Trace root: neither producer is a zenode node, so no context arrives",
     )
-    #: Published by the MOLA container under a key outside the namespace.
-    lidar_odometry = Topic.absolute("lidar_odometry/pose", OdometryState)
-    # TODO: MOLA publishes on the same topic localization/pose, maybe change?
 
 
 class NavTopics(TopicSet):
@@ -157,12 +190,20 @@ class NavTopics(TopicSet):
     cancel = Topic("nav/cancel", NavigationCancel)
     status = Topic("nav/status", NavigationStatus, latched=True)
     planned_path = Topic("nav/planned_path", PlannedPath, latched=True)
-    protective_field = Topic("nav/protective_field", ProtectiveFieldEvent, latched=True)
 
 
-# TODO(port): sensor topics, once their payload types are ported — camera and
-# image envelopes (bytes with RawCodec(Encoding.IMAGE_JPEG), shm=True for
-# frames) and the Livox point cloud as
-# Topic.absolute("livox/lidar", bytes, codec=CdrCodec(...)) behind the [livox]
-# extra. Omitted rather than guessed: an incorrect codec is a silent wire
-# incompatibility.
+# TODO(port): sensor and controller topics. Wire formats observed on a running
+# stack, so these need no guessing:
+#
+#   robodog/sensors/go2_camera          raw JPEG (SOI + JFIF), ~14 Hz
+#                                       -> Topic(..., bytes,
+#                                          codec=RawCodec(Encoding.IMAGE_JPEG),
+#                                          shm=True)
+#   robodog/sensors/livox/pointcloud    ROS 2 CDR PointCloud2, 10 Hz
+#   robodog/sensors/livox/imu           ROS 2 CDR Imu, 200 Hz
+#                                       -> bytes + a CDR codec, [livox] extra
+#   nodes/joy                           JSON, ~15 Hz -> ControllerState
+#
+# The Livox pair is published twice: once under livox/* by
+# zenoh-bridge-ros2dds and once republished under robodog/sensors/livox/*.
+# Only the namespaced keys belong in this contract.

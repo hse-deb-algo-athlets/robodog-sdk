@@ -15,16 +15,15 @@ reads better for what you are building.
 
 ## Running them
 
-Bring up a stack first (simulation is enough — the examples never touch
-hardware), then point the node at the router:
+Bring up a stack first — simulation is enough, the examples never touch
+hardware. Transport and namespace come from [`zenode.toml`](../zenode.toml) in
+the repository root; override either with `ZENODE_CONFIG` or
+`ZENODE_TRANSPORT__NAMESPACE`.
 
-```toml
-# zenode.toml, next to wherever you run from
-[transport]
-mode = "client"
-connect = ["tcp/localhost:7447"]
-namespace = "robodog"
-```
+> `client_drive.py` additionally needs the **arbiter** node, which grants the
+> command lane. It is step 3 of the ADR-010 rollout and does not exist yet, so
+> against today's stack it stops with `nodes not present: arbiter`.
+> `contract_drive.py` runs without it.
 
 ```bash
 uv run python examples/contract_drive.py

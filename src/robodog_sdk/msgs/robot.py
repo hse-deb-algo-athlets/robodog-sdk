@@ -24,14 +24,6 @@ class CommandedStance(StrEnum):
     SITTING = "sitting"
 
 
-class ConnectionStatus(BaseModel):
-    """State of the link between the bridge and the robot."""
-
-    connected: bool = False
-    motion_mode: str = "unknown"
-    stance: CommandedStance = CommandedStance.UNDEFINED
-
-
 class IMUState(BaseModel):
     quaternion: list[float] = Field(default_factory=list)
     gyroscope: list[float] = Field(default_factory=list)

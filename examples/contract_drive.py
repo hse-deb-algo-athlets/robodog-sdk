@@ -29,9 +29,9 @@ from robodog_sdk import (
     MotionTopics,
     MovementCommand,
     MovementSource,
-    NavTopics,
     OdometryState,
     ProtectiveFieldEvent,
+    SafetyTopics,
     StateTopics,
 )
 
@@ -49,7 +49,7 @@ class ContractDrive(Node):
     config: DriveConfig
 
     #: Materialized before ``on_start`` and usable from it.
-    cmd = publish(MotionTopics.move_agent)
+    cmd = publish(MotionTopics.move)
 
     # Declared here, assigned in on_start: plain state needs no session, but
     # declaring it keeps the node's attributes discoverable in one place.
@@ -74,7 +74,7 @@ class ContractDrive(Node):
         self._travelled = math.hypot(msg.x - self._origin[0], msg.y - self._origin[1])
         self._pose_trace = trace.current()
 
-    @subscribe(NavTopics.protective_field)
+    @subscribe(SafetyTopics.protective_field)
     async def on_protective_field(self, msg: ProtectiveFieldEvent) -> None:
         """Handle a protective-field transition: one message per edge."""
         self._blocked = msg.active

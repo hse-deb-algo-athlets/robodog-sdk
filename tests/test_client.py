@@ -12,8 +12,8 @@ import pytest
 from zenode import Node
 from zenode.testing import harness
 
-from robodog_sdk import ActionType, Lane, MotionTopics, RobotClient
-from robodog_sdk.testing import FakeStack
+from robodog_sdk import ActionType, Lane, MotionTopics, RobotClient, SafetyTopics
+from robodog_sdk.testing import FakeArbiter, FakeStack
 
 pytestmark = pytest.mark.integration
 
@@ -29,15 +29,16 @@ class _Agent(Node):
         self.robot = RobotClient(self)
 
 
-async def _agent_with_stack(h) -> tuple[_Agent, FakeStack]:
+async def _agent_with_stack(h) -> tuple[_Agent, FakeStack, FakeArbiter]:
     stack = await h.start_node(FakeStack)
+    arbiter = await h.start_node(FakeArbiter)
     agent = await h.start_node(_Agent)
-    return agent, stack
+    return agent, stack, arbiter
 
 
 async def test_move_reaches_the_agent_lane() -> None:
     async with harness() as h:
-        agent, _ = await _agent_with_stack(h)
+        agent, _, _ = await _agent_with_stack(h)
         out = h.collect(MotionTopics.move_agent)
 
         agent.robot.move(x=0.4, z_deg=15.0)
@@ -48,7 +49,7 @@ async def test_move_reaches_the_agent_lane() -> None:
 
 async def test_state_view_sees_latched_state() -> None:
     async with harness() as h:
-        agent, stack = await _agent_with_stack(h)
+        agent, stack, _ = await _agent_with_stack(h)
 
         stack.set_pose(x=1.5, y=-2.0)
         await asyncio.sleep(0.2)
@@ -69,7 +70,7 @@ async def test_state_view_reports_missing_data_as_infinite_age() -> None:
 
 async def test_driving_republishes_then_stops() -> None:
     async with harness() as h:
-        agent, stack = await _agent_with_stack(h)
+        agent, stack, _ = await _agent_with_stack(h)
 
         async with agent.robot.driving(x=0.2, rate_hz=20.0):
             await asyncio.sleep(0.3)
@@ -81,20 +82,20 @@ async def test_driving_republishes_then_stops() -> None:
 
 async def test_control_acquires_and_releases_the_lane() -> None:
     async with harness() as h:
-        agent, stack = await _agent_with_stack(h)
+        agent, stack, arbiter = await _agent_with_stack(h)
 
         async with agent.robot.control(reason="test"):
             pass
 
         await asyncio.sleep(0.1)
-        assert [r.lane for r in stack.granted] == [Lane.agent]
+        assert [r.lane for r in arbiter.granted] == [Lane.agent]
         assert stack.stopped, "releasing the lane must stop the robot"
 
 
 async def test_action_and_estop_are_published() -> None:
     async with harness() as h:
-        agent, _ = await _agent_with_stack(h)
-        actions = h.collect(MotionTopics.estop)
+        agent, _, _ = await _agent_with_stack(h)
+        actions = h.collect(SafetyTopics.estop)
 
         agent.robot.action(ActionType.hello)
         agent.robot.emergency_stop()

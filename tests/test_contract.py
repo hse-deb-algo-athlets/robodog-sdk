@@ -10,7 +10,7 @@ import pytest
 from zenode import registered_services, registered_topics
 
 import robodog_sdk  # noqa: F401  — importing registers the TopicSets
-from robodog_sdk.topics import MotionTopics
+from robodog_sdk.topics import MotionTopics, SafetyTopics
 
 TOPICS = [(entry.owner + "." + entry.attr, topic) for entry, topic in registered_topics()]
 SERVICES = [(entry.owner + "." + entry.attr, svc) for entry, svc in registered_services()]
@@ -75,4 +75,4 @@ def test_command_topics_are_perishable() -> None:
 
 def test_estop_is_latched() -> None:
     """A node joining during a stop learns of it without waiting for an edge."""
-    assert MotionTopics.estop.latched
+    assert SafetyTopics.estop.latched

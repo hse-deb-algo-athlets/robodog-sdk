@@ -10,6 +10,10 @@ Equivalent to ``contract_drive.py``. The client supplies:
 - ``state``, which carries the latched pose and its age, removing the
   subscription and the first-message bookkeeping.
 
+Requires the arbiter node, which grants the command lane. ``contract_drive.py``
+does not, so use that one against a stack where the arbiter is not deployed
+yet.
+
 The behaviour runs as a background task rather than inline in ``on_start``:
 decorated bindings are wired after ``on_start`` returns, so blocking there
 would leave the handlers inactive.
@@ -22,7 +26,7 @@ import math
 
 from zenode import Node, NodeConfig, run, subscribe
 
-from robodog_sdk import NavTopics, ProtectiveFieldEvent, RobotClient
+from robodog_sdk import ProtectiveFieldEvent, RobotClient, SafetyTopics
 
 
 class DriveConfig(NodeConfig):
@@ -45,11 +49,16 @@ class ClientDrive(Node):
         self._blocked = False
         self.spawn(self._run_drive(), name="drive")
 
-    @subscribe(NavTopics.protective_field)
+    @subscribe(SafetyTopics.protective_field)
     async def on_protective_field(self, msg: ProtectiveFieldEvent) -> None:
         self._blocked = msg.active
 
     async def _run_drive(self) -> None:
+        # control() calls the arbiter's acquire service. Waiting for its
+        # presence first turns "no arbiter deployed" into a named error rather
+        # than an opaque service timeout — the arbiter is step 3 of the ADR-010
+        # rollout, so on a stack without it this is where you stop.
+        await self.robot.wait_until_ready("arbiter", timeout=5.0)
         origin = await self._first_pose()
         self.log.info("drive started at %.2f, %.2f", origin[0], origin[1])
 
