@@ -12,8 +12,9 @@ Handled explicitly here:
   motion requires a timer rather than a single ``put()``.
 - Stopping on shutdown. ``on_stop`` publishes zero velocity; without it the
   robot continues until the deadman elapses.
-- The lane handshake is omitted, so this node runs at the arbiter's lowest
-  priority. ``client_drive.py`` shows the acquire and release.
+- The command's rank. ``source=autonomous`` is what makes the gateway hand the
+  robot to a human the moment one touches the gamepad, and it is carried on
+  every frame rather than agreed once.
 - Trace continuity across the timer. ``state/odometry`` is a trace root, but a
   timer body runs outside any trace, so the pose's context is captured in the
   handler and restored before publishing.
@@ -26,11 +27,11 @@ import math
 from zenode import Node, NodeConfig, every, publish, run, subscribe, trace
 
 from robodog_sdk import (
+    CollisionZoneEvent,
     MotionTopics,
     MovementCommand,
     MovementSource,
     OdometryState,
-    ProtectiveFieldEvent,
     SafetyTopics,
     StateTopics,
 )
@@ -48,8 +49,10 @@ class ContractDrive(Node):
     name = "contract-drive"
     config: DriveConfig
 
-    #: Materialized before ``on_start`` and usable from it.
-    cmd = publish(MotionTopics.move)
+    #: Materialized before ``on_start`` and usable from it. The gateway inlet,
+    #: not ``move``: that key is the gateway's output, and publishing there
+    #: would bypass both arbitration and the collision zones.
+    cmd = publish(MotionTopics.request)
 
     # Declared here, assigned in on_start: plain state needs no session, but
     # declaring it keeps the node's attributes discoverable in one place.
@@ -74,11 +77,11 @@ class ContractDrive(Node):
         self._travelled = math.hypot(msg.x - self._origin[0], msg.y - self._origin[1])
         self._pose_trace = trace.current()
 
-    @subscribe(SafetyTopics.protective_field)
-    async def on_protective_field(self, msg: ProtectiveFieldEvent) -> None:
-        """Handle a protective-field transition: one message per edge."""
+    @subscribe(SafetyTopics.collision_zone)
+    async def on_collision_zone(self, msg: CollisionZoneEvent) -> None:
+        """Handle a collision-zone transition: one message per edge."""
         self._blocked = msg.active
-        self.log.warning("protective field %s", "breached" if msg.active else "clear")
+        self.log.warning("collision zone %s", "breached" if msg.active else "clear")
 
     @every("rate_hz", unit="hz")
     async def tick(self) -> None:

@@ -47,7 +47,7 @@ class GamepadState(BaseModel):
     """Complete gamepad snapshot.
 
     Raw input, not a command: the teleoperation node maps this onto the
-    ``teleop`` movement lane. A consumer reading it directly is observing what
+    gateway inlet as ``controller``. A consumer reading it directly is observing what
     the operator is doing, not driving the robot.
     """
 

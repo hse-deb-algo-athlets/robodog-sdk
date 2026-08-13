@@ -1,15 +1,14 @@
 """High-level client for the Robodog contract.
 
 :class:`RobotClient` publishes and subscribes on the keys declared in
-:mod:`robodog_sdk.topics`, with the same payload types and the same arbiter
+:mod:`robodog_sdk.topics`, with the same payload types and the same gateway
 priority as any other node. It holds no privileged channel; using the contract
 directly is equivalent::
 
-    cmd = publish(MotionTopics.move_agent)
+    cmd = publish(MotionTopics.request)
 
-Scope (ADR-010): message construction, lane handshake, latched state, and
-request correlation. No behaviours, no retry or reconnection policy, no caching
-that masks staleness.
+Scope (ADR-010): message construction, latched state, and task correlation. No
+behaviours, no retry or reconnection policy, no caching that masks staleness.
 """
 
 from __future__ import annotations
@@ -17,39 +16,45 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import TYPE_CHECKING, Generic, TypeVar
 
 from zenode import Node, TransportConfig
+from zenode.service import call_service
 
-from .msgs.control import ControlRelease, ControlRequest, Lane
 from .msgs.motion import (
     ActionCommand,
     ActionType,
     EmergencyStop,
     EmergencyStopCommand,
+    MotionGatewayStatus,
     MovementCommand,
     MovementSource,
     TiltBody,
 )
 from .msgs.navigation import (
-    NavigationCancel,
-    NavigationRequest,
-    NavigationSegment,
-    NavigationState,
-    NavigationStatus,
+    CancelAck,
+    CancelRequest,
+    NavigateThroughPosesGoal,
+    NavigateToPoseGoal,
     Pose2D,
+    TaskFeedback,
+    TaskGoal,
+    TaskGoalEnvelope,
+    TaskHandle,
+    TaskResult,
+    TaskStatusRequest,
 )
 from .msgs.robot import BatteryState, OdometryState, RobotHighState
 from .topics import (
-    ControlServices,
     ControlTopics,
     MotionTopics,
+    NavServices,
     NavTopics,
     PoseTopics,
     SafetyTopics,
     StateTopics,
+    task_status_service,
 )
 
 if TYPE_CHECKING:
@@ -60,6 +65,15 @@ T = TypeVar("T")
 #: Default republish rate for :meth:`RobotClient.driving`, in Hz. Well inside
 #: ``COMMAND_MAX_AGE``, so a dropped sample does not interrupt motion.
 DRIVE_RATE_HZ = 10.0
+
+#: Seconds to wait for the navigation coordinator to answer a submit or a
+#: cancel. Generous, because a preempting submit answers only once the
+#: displaced task has actually stopped.
+NAV_CALL_TIMEOUT = 6.0
+
+#: How many finished tasks the client keeps results for, so that
+#: :meth:`RobotClient.wait_for_task` works when called after the fact.
+NAV_RESULT_HISTORY = 32
 
 
 class Latest(Generic[T]):
@@ -97,9 +111,10 @@ class Latest(Generic[T]):
 class StateView:
     """Robot state as last received by this process.
 
-    Every field is a :class:`Latest`; all are backed by latched topics, so they
-    are populated shortly after the client is created rather than on the next
-    publish.
+    Every field is a :class:`Latest`. All but :attr:`nav` are backed by latched
+    topics, so they are populated shortly after the client is created rather
+    than on the next publish; navigation feedback exists only while a task
+    runs, so its age is what tells you whether one does.
     """
 
     def __init__(self) -> None:
@@ -107,7 +122,12 @@ class StateView:
         self.localization: Latest[OdometryState] = Latest()
         self.battery: Latest[BatteryState] = Latest()
         self.highstate: Latest[RobotHighState] = Latest()
-        self.nav: Latest[NavigationStatus] = Latest()
+        #: Most recent :class:`TaskFeedback`, from whichever task published it.
+        self.nav: Latest[TaskFeedback] = Latest()
+        #: The gateway's last decision: who is driving, and what was done to
+        #: their command. Edge-published, so its age is the time since the last
+        #: change, not the time since the last tick.
+        self.gateway: Latest[MotionGatewayStatus] = Latest()
 
 
 class RobotClient:
@@ -125,13 +145,16 @@ class RobotClient:
     own session::
 
         async with RobotClient.connect() as robot:
-            async with robot.control(), robot.driving(x=0.3):
+            async with robot.driving(x=0.3):
                 await asyncio.sleep(2)
 
     Args:
         node: The node whose session, publishers and subscriptions are used.
-        source: Provenance stamped on outgoing movement commands. Diagnostic
-            only — priority follows the lane, not this field.
+        source: Stamped on every outgoing movement command, and therefore what
+            decides whether this client's commands beat anyone else's. The
+            default loses to teleoperation and to navigation, which is what a
+            node you are writing should do; raise it only if this process
+            genuinely is the thing the higher rank names.
     """
 
     def __init__(self, node: Node, *, source: MovementSource = MovementSource.autonomous) -> None:
@@ -139,20 +162,23 @@ class RobotClient:
         self._source = source
         self.state = StateView()
 
-        self._move = node.publisher(MotionTopics.move_agent)
+        self._move = node.publisher(MotionTopics.request)
         self._estop = node.publisher(SafetyTopics.estop)
         self._action = node.publisher(PoseTopics.action)
         self._tilt = node.publisher(PoseTopics.tilt_body)
-        self._nav_request = node.publisher(NavTopics.request)
-        self._nav_cancel = node.publisher(NavTopics.cancel)
-        self._control_release = node.publisher(ControlTopics.release)
 
         node.subscribe(StateTopics.odometry, self.state.odometry.update, mode="latest")
         node.subscribe(StateTopics.battery, self.state.battery.update, mode="latest")
         node.subscribe(StateTopics.highstate, self.state.highstate.update, mode="latest")
-        node.subscribe(NavTopics.status, self._on_nav_status, mode="latest")
+        node.subscribe(ControlTopics.status, self.state.gateway.update, mode="latest")
+        # Both wildcards, and both declared here rather than per task: a result
+        # is published once and is not latched, so a subscription declared
+        # after the submit returns can miss a task that failed immediately.
+        node.subscribe(NavTopics.feedback, self._on_task_feedback, mode="latest")
+        node.subscribe(NavTopics.result, self._on_task_result)
 
-        self._nav_waiters: dict[str, asyncio.Future[NavigationState]] = {}
+        self._task_waiters: dict[str, asyncio.Future[TaskResult]] = {}
+        self._task_results: dict[str, TaskResult] = {}
 
     # ------------------------------------------------------------ standalone
 
@@ -173,7 +199,7 @@ class RobotClient:
         Args:
             transport: Transport configuration. Defaults to the resolved
                 deployment configuration.
-            name: Node name used for presence and for lane requests.
+            name: Node name used for presence and in service calls.
         """
 
         class _ClientNode(Node):
@@ -189,38 +215,47 @@ class RobotClient:
 
     # --------------------------------------------------------------- control
 
-    @contextlib.asynccontextmanager
-    async def control(
-        self, *, lane: Lane = Lane.agent, ttl: float = 30.0, reason: str = ""
-    ) -> AsyncIterator[None]:
-        """Hold a command lane for the duration of the block.
+    @property
+    def source(self) -> MovementSource:
+        """The rank this client's commands are sent at."""
+        return self._source
 
-        Commands sent without holding the lane are still delivered, but rank
-        below the current holder. The lane is released on exit, after a stop.
+    @property
+    def driving_now(self) -> bool:
+        """Whether the gateway is currently forwarding *this* client's source.
 
-        Args:
-            lane: Lane to request. Defaults to :attr:`Lane.agent`.
-            ttl: Seconds the grant remains valid if not renewed.
-            reason: Free text recorded by the arbiter.
-
-        Raises:
-            PermissionError: The lane is held by another node.
+        ``False`` also when no status has arrived at all, so it answers "am I
+        demonstrably the driver", not "is anyone else". Compare
+        :attr:`preempted_by`.
         """
-        grant = await self._node.call(
-            ControlServices.acquire,
-            ControlRequest(node=self._node.name, lane=lane, ttl=ttl, reason=reason),
-        )
-        if not grant.granted:
-            raise PermissionError(
-                f"lane {lane.value!r} not granted"
-                + (f" — held by {grant.holder!r}" if grant.holder else "")
-                + (f": {grant.detail}" if grant.detail else "")
-            )
-        try:
-            yield
-        finally:
-            self.halt()
-            self._control_release.put(ControlRelease(node=self._node.name, lane=lane))
+        status = self.state.gateway.value
+        return status is not None and status.active_source is self._source
+
+    @property
+    def preempted_by(self) -> MovementSource | None:
+        """The source that is out-ranking this client, if any.
+
+        ``None`` when nothing is, which covers both "we are driving" and
+        "nobody is driving". There is nothing to do about a preemption except
+        notice it: the gateway re-decides on every frame, so a client that
+        keeps publishing resumes automatically once the higher source falls
+        silent.
+        """
+        status = self.state.gateway.value
+        if status is None or status.active_source is None:
+            return None
+        active = status.active_source
+        return active if active.outranks(self._source) else None
+
+    @property
+    def blocked_by_zone(self) -> list[str]:
+        """Names of the collision zones currently holding the robot back.
+
+        Empty when nothing is breached — which is not the same as "the robot
+        will move": see :attr:`StateView.gateway` for the watchdog.
+        """
+        status = self.state.gateway.value
+        return list(status.active_zones) if status is not None else []
 
     # -------------------------------------------------------------- commands
 
@@ -303,80 +338,230 @@ class RobotClient:
         *,
         timeout: float | None = None,
         max_speed: float | None = None,
-    ) -> NavigationState:
-        """Request navigation to a point and wait for the outcome.
+        skill: str | None = None,
+        preempt: bool = False,
+    ) -> TaskResult:
+        """Navigate to a point and wait for the task to finish.
 
         Args:
             x: Target x in the ``map`` frame, m.
             y: Target y in the ``map`` frame, m.
-            heading: Required orientation on arrival, rad. ``None`` leaves it
-                unconstrained.
+            heading: Requested orientation on arrival, rad. ``None`` leaves the
+                final heading a don't-care. Requested, not guaranteed: a skill
+                configured to arrive on position alone ignores it rather than
+                turning on the spot at the goal.
             timeout: Seconds to wait for a terminal state. ``None`` waits
-                indefinitely.
-            max_speed: Segment speed limit, m/s. ``None`` uses the deployment
-                default.
+                indefinitely, which is what a skill that waits out an obstacle
+                rather than giving up requires.
+            max_speed: Speed limit for the task, m/s. ``None`` uses the
+                skill's configured cruise speed.
+            skill: Skill to run the goal. ``None`` uses the deployment default.
+            preempt: Displace a task that is already running. Without it a
+                submit made while the robot is navigating is refused.
 
         Returns:
-            The terminal state: ``ARRIVED_FINAL``, ``BLOCKED`` or ``FAILED``.
+            The terminal :class:`TaskResult`. Check ``result.succeeded``, or
+            ``result.state`` for which of the four terminal states it reached
+            and ``result.message`` for why.
+
+        Raises:
+            PermissionError: The coordinator refused the goal — another task is
+                running and ``preempt`` was not set, or the skill is unknown.
+            TimeoutError: No terminal state arrived within ``timeout``.
+            zenode.ServiceTimeout: Nothing answered the submit. Usually the
+                navigation node is not running, or the namespace is wrong.
+
+        Cancelling the awaiting task stops the wait, not the robot. Call
+        :meth:`cancel_task` to stop navigating.
+        """
+        goal = NavigateToPoseGoal(
+            target=Pose2D(x=x, y=y, theta=heading or 0.0),
+            orientation_at_target=heading,
+            max_speed=max_speed,
+            skill=skill,
+        )
+        return await self.run_goal(goal, timeout=timeout, preempt=preempt)
+
+    async def navigate_through(
+        self,
+        poses: Sequence[Pose2D] | Sequence[tuple[float, float]],
+        *,
+        final_heading: float | None = None,
+        timeout: float | None = None,
+        max_speed: float | None = None,
+        skill: str | None = None,
+        preempt: bool = False,
+    ) -> TaskResult:
+        """Navigate a route through several poses and wait for the outcome.
+
+        Args:
+            poses: The route, in order; the last one is the target. Accepts
+                :class:`Pose2D` or plain ``(x, y)`` pairs.
+            final_heading: Requested orientation at the last pose, rad.
+            timeout: As :meth:`navigate_to`.
+            max_speed: As :meth:`navigate_to`.
+            skill: As :meth:`navigate_to`. A skill that plans for itself may
+                route to the last pose directly instead of following the
+                intermediate ones — pass ``"waypoint_follow"`` when the route
+                is the point.
+            preempt: As :meth:`navigate_to`.
+        """
+        goal = NavigateThroughPosesGoal(
+            poses=[
+                p if isinstance(p, Pose2D) else Pose2D(x=p[0], y=p[1], theta=0.0) for p in poses
+            ],
+            final_orientation=final_heading,
+            max_speed=max_speed,
+            skill=skill,
+        )
+        return await self.run_goal(goal, timeout=timeout, preempt=preempt)
+
+    async def run_goal(
+        self, goal: TaskGoal, *, timeout: float | None = None, preempt: bool = False
+    ) -> TaskResult:
+        """Submit a goal and wait for its result. Submit plus wait, in one call.
+
+        Raises:
+            PermissionError: The goal was not accepted.
+            TimeoutError: No terminal state arrived within ``timeout``.
+        """
+        handle = await self.submit(goal, preempt=preempt)
+        if not handle.accepted:
+            raise PermissionError(
+                f"navigation goal not accepted: {handle.reason or 'no reason given'}"
+            )
+        return await self.wait_for_task(handle.task_id, timeout=timeout)
+
+    async def submit(self, goal: TaskGoal, *, preempt: bool = False) -> TaskHandle:
+        """Submit a goal without waiting for it to finish.
+
+        For fire-and-forget navigation, and for the case where the caller wants
+        to watch :attr:`state.nav <StateView.nav>` rather than block. Pair it
+        with :meth:`wait_for_task` when you want the result later: the client
+        subscribes to results for its whole lifetime, so waiting after the fact
+        is safe.
+
+        Returns:
+            The coordinator's :class:`TaskHandle`. ``accepted=False`` is an
+            ordinary answer here, not an exception — unlike :meth:`run_goal`.
+
+        Raises:
+            zenode.ServiceTimeout: Nothing answered on the submit key.
+        """
+        # preempt travels as a query parameter rather than in the payload, so
+        # the goal on the wire stays exactly the goal. zenode has no API for
+        # query parameters, hence the selector built by hand here.
+        key = NavServices.submit.resolve(self._node.namespace)
+        if preempt:
+            key = f"{key}?preempt=true"
+        return await call_service(
+            self._node.session,
+            NavServices.submit,
+            key,
+            TaskGoalEnvelope(goal),
+            timeout=NAV_CALL_TIMEOUT,
+            node=self._node.name,
+        )
+
+    async def wait_for_task(self, task_id: str, *, timeout: float | None = None) -> TaskResult:
+        """Wait for a task to reach a terminal state.
+
+        Returns immediately if the result has already arrived. Safe to call
+        long after the submit — results are kept for the last
+        ``NAV_RESULT_HISTORY`` tasks — and safe to call from several places at
+        once for the same task.
 
         Raises:
             TimeoutError: No terminal state arrived within ``timeout``.
-
-        Cancelling the awaiting task stops the wait, not the robot; call
-        :meth:`cancel_navigation` to stop navigating.
         """
-        request_id = uuid.uuid4().hex
+        recorded = self._task_results.get(task_id)
+        if recorded is not None:
+            return recorded
         loop = asyncio.get_running_loop()
-        waiter: asyncio.Future[NavigationState] = loop.create_future()
-        self._nav_waiters[request_id] = waiter
-
-        self._nav_request.put(
-            NavigationRequest(
-                request_id=request_id,
-                segments=[
-                    NavigationSegment(
-                        target=Pose2D(x=x, y=y, theta=heading or 0.0),
-                        orientation_at_target=heading,
-                        max_speed=max_speed,
-                    )
-                ],
-            )
-        )
+        waiter: asyncio.Future[TaskResult] = loop.create_future()
+        self._task_waiters[task_id] = waiter
         try:
             return await asyncio.wait_for(waiter, timeout)
         finally:
-            self._nav_waiters.pop(request_id, None)
+            self._task_waiters.pop(task_id, None)
 
-    def cancel_navigation(self, request_id: str = "", reason: str = "") -> None:
-        """Abandon a navigation request and stop.
+    async def cancel_task(self, task_id: str) -> CancelAck:
+        """Abandon a task and stop.
 
-        Args:
-            request_id: Request to cancel. Empty cancels whatever is running.
-            reason: Free text recorded by the navigation node.
+        ``canceled=False`` in the reply means the coordinator did nothing,
+        which is the normal answer for a task that had already finished.
+
+        Raises:
+            zenode.ServiceTimeout: Nothing answered on the cancel key.
         """
-        self._nav_cancel.put(NavigationCancel(request_id=request_id or None, reason=reason))
+        return await self._node.call(
+            NavServices.cancel, CancelRequest(task_id=task_id), timeout=NAV_CALL_TIMEOUT
+        )
 
-    def _on_nav_status(self, status: NavigationStatus) -> None:
-        self.state.nav.update(status)
-        if status.request_id is None or not status.state.is_terminal:
+    async def task_status(self, task_id: str) -> TaskResult:
+        """Ask the coordinator what became of a task.
+
+        For a process that did not watch the task itself. The reply is
+        :attr:`TaskState.PENDING` for a task the coordinator does not know —
+        including one it has already forgotten — so a ``PENDING`` answer means
+        "no information", not "queued".
+
+        Raises:
+            zenode.ServiceTimeout: Nothing answered on the status key.
+        """
+        return await self._node.call(
+            task_status_service(task_id),
+            TaskStatusRequest(task_id=task_id),
+            timeout=NAV_CALL_TIMEOUT,
+        )
+
+    @property
+    def navigating(self) -> bool:
+        """Whether navigation feedback has arrived recently.
+
+        A heuristic, and the only one available: feedback is published by the
+        running skill, so silence means either no task or a task whose skill
+        has stopped publishing. It is not a substitute for the result.
+        """
+        return self.state.nav.fresh(within=1.0)
+
+    def _on_task_feedback(self, feedback: TaskFeedback) -> None:
+        self.state.nav.update(feedback)
+
+    def _on_task_result(self, result: TaskResult) -> None:
+        if not result.state.is_terminal:
+            # A non-terminal payload on the result key is a producer bug; keep
+            # it out of the history so a later wait does not resolve on it.
             return
-        waiter = self._nav_waiters.get(status.request_id)
+        self._task_results[result.task_id] = result
+        while len(self._task_results) > NAV_RESULT_HISTORY:
+            self._task_results.pop(next(iter(self._task_results)))
+        waiter = self._task_waiters.get(result.task_id)
         if waiter is not None and not waiter.done():
-            waiter.set_result(status.state)
+            waiter.set_result(result)
 
     # ------------------------------------------------------------- readiness
 
     async def wait_until_ready(self, *nodes: str, timeout: float = 10.0) -> None:
         """Wait until the named nodes hold presence tokens.
 
+        Only zenode nodes hold one, so this answers "is that node up" for the
+        parts of the stack built on zenode and nothing at all for the rest.
+        There is no default: which nodes your behaviour needs is your
+        behaviour's business, and waiting for the wrong one is worse than not
+        waiting.
+
         Args:
-            nodes: Node names to wait for. Defaults to ``arbiter``.
+            nodes: Node names to wait for. At least one.
             timeout: Seconds to wait.
 
         Raises:
+            ValueError: No node names were given.
             TimeoutError: A node was still absent when the timeout elapsed.
         """
-        await self._node.wait_for_nodes(list(nodes) or ["arbiter"], timeout=timeout)
+        if not nodes:
+            raise ValueError("wait_until_ready() needs at least one node name")
+        await self._node.wait_for_nodes(list(nodes), timeout=timeout)
 
     # ------------------------------------------------------------- lifecycle
 
