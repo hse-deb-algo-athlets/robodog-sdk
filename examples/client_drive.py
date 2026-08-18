@@ -1,23 +1,17 @@
-"""Drive forward a fixed distance, using RobotClient.
+"""Drive forward a fixed distance, using ``RobotClient``.
 
     uv run python examples/client_drive.py
 
-Equivalent to ``contract_drive.py``. The client supplies:
+Equivalent to ``contract_drive.py``. The client supplies ``driving()``
+(republishes at 10 Hz, stops on exit), ``state`` (latched pose and its age)
+and ``preempted_by`` (who outranks us at the gateway).
 
-- ``driving()``, which republishes at 10 Hz and sends zero velocity on exit,
-  removing the timer and the ``on_stop`` handler.
-- ``state``, which carries the latched pose and its age, removing the
-  subscription and the first-message bookkeeping.
-- ``preempted_by``, which names whoever out-ranks us at the gateway.
+Distance is measured against ``state.odometry`` rather than
+``state.localization``: the fused pose jumps when SLAM corrects, which reads
+here as having driven backwards.
 
-There is no handshake to perform. Priority rides on every command, so this node
-simply publishes at the ``autonomous`` rank and yields to anything above it
-without being told to. Noticing that it has been yielded past is optional —
-here it is done only to log it and stop cleanly.
-
-The behaviour runs as a background task rather than inline in ``on_start``:
-decorated bindings are wired after ``on_start`` returns, so blocking there
-would leave the handlers inactive.
+The drive runs as a background task because decorated bindings are wired only
+after ``on_start`` returns.
 """
 
 from __future__ import annotations
@@ -61,10 +55,9 @@ class ClientDrive(Node):
         async with self.robot.driving(x=self.config.speed):
             while not self._blocked and self._travelled_from(origin) < self.config.distance:
                 if (driver := self.robot.preempted_by) is not None:
-                    # Nothing to release and nothing to reacquire: the gateway
-                    # re-decides every frame, so continuing to publish would
-                    # resume the drive by itself once they let go. Giving up is
-                    # this example's choice, not the contract's.
+                    # The gateway re-decides every frame, so continuing to
+                    # publish would resume the drive once they let go. Giving
+                    # up is this example's choice, not the contract's.
                     self.log.info("yielding to %s", driver.value)
                     break
                 await asyncio.sleep(0.1)
@@ -85,8 +78,8 @@ class ClientDrive(Node):
     def _travelled_from(self, origin: tuple[float, float]) -> float:
         pose = self.robot.state.odometry.value
         if pose is None or self.robot.state.odometry.age > 1.0:
-            # Stale pose: report no progress rather than an unfounded figure.
-            # The drive continues; the distance simply stops advancing.
+            # Stale pose: report no progress rather than a figure we cannot
+            # support. The drive continues; the distance stops advancing.
             return 0.0
         return math.hypot(pose.x - origin[0], pose.y - origin[1])
 

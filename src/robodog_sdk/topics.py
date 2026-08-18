@@ -210,6 +210,7 @@ class SafetyTopics(TopicSet):
         latched=True,
         description="Legacy edge mirror of the latch — prefer `state`",
     )
+    # TODO: Define correct blocked topic, LATCHED?
     collision_zone = Topic(
         "motion/collision/event",
         CollisionZoneEvent,

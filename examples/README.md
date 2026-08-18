@@ -37,7 +37,12 @@ the repository root; override either with `ZENODE_CONFIG` or
 >
 > `navigate.py` needs the **nav** node, a localization source and a global map
 > — everything the navigation stack normally brings up. Without them it stops
-> with `nodes not present: nav`.
+> with `no navigation coordinator answered`.
+>
+> It asks nav a question to find that out rather than waiting for a presence
+> token, because no node of the stack holds one: they are plain Zenoh
+> applications, invisible to `wait_until_ready()`. That method is for waiting
+> on peers built on this package.
 
 ```bash
 uv run python examples/contract_drive.py

@@ -457,3 +457,34 @@ async def test_the_fused_pose_reaches_the_state_view() -> None:
 
         assert agent.robot.state.localization.value is not None
         assert agent.robot.state.localization.value.x == 3.0
+
+
+async def test_wait_for_nav_returns_when_the_coordinator_answers() -> None:
+    """The coordinator holds no presence token, so liveness is a question it
+    answers, not a token it holds."""
+    async with harness() as h:
+        agent, _ = await _agent_with_nav(h)
+
+        await agent.robot.wait_for_nav(timeout=5.0)
+
+
+async def test_wait_for_nav_times_out_when_nothing_serves_the_key() -> None:
+    """Silence must not read as an answer. ``ServiceTimeout`` subclasses
+    ``ServiceError``, so the "no such task" refusal that signals liveness is
+    one catch away from swallowing the case where nav is simply absent."""
+    async with harness() as h:
+        agent = await h.start_node(_Agent)  # no FakeNav
+
+        with pytest.raises(TimeoutError):
+            await agent.robot.wait_for_nav(timeout=1.0, poll=0.2)
+
+
+async def test_stack_nodes_are_not_waitable_by_presence() -> None:
+    """The double is a zenode node and so has presence; the real nav node does
+    not, which is the whole reason wait_for_nav exists."""
+    async with harness() as h:
+        agent, _ = await _agent_with_nav(h)
+
+        await agent.robot.wait_until_ready("nav", timeout=5.0)  # the double, not the stack
+        with pytest.raises(ValueError):
+            await agent.robot.wait_until_ready()

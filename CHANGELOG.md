@@ -89,7 +89,7 @@ recovery phase machine, and publishes the one authority on `safety/state`.
   name again.
 - `TaskFeedback` gained `current_segment_index` / `total_segments` — which
   waypoint of a route has been reached, reported as it is passed rather than at
-  the end of the leg.
+  the end of the route.
 - **`EstopPolicy`, as `?on_estop=` on the submit.** The default, `CANCEL`,
   discards the task on a stop; nothing here could previously ask for anything
   else, so every task submitted through this package was silently discarded.
@@ -102,6 +102,25 @@ recovery phase machine, and publishes the one authority on `safety/state`.
   carried it.
 - `corridor_assist` joins the documented skills — plans with A*, hands the
   wheel to a reactive controller through the tight bits.
+
+### Waiting for the stack never worked
+
+`wait_until_ready()` waits for zenode presence tokens, at
+`<ns>/node/<name>`. **No node of the control stack holds one** — nav, the
+motion gateway, the safety aggregator and the robot bridge are plain Zenoh
+applications. `wait_until_ready("nav")` therefore raised `TimeoutError` with
+nav running perfectly well, and `examples/navigate.py` opened by calling
+exactly that.
+
+- `RobotClient.wait_for_nav()` replaces it for navigation. The coordinator
+  holds no token, so this asks it the status of a task that cannot exist: a
+  running one refuses on the error channel, and only a running one can produce
+  that refusal. `ServiceTimeout` **subclasses** `ServiceError`, so the two
+  clauses are ordered — the other way round reads silence as an answer and
+  reports an absent coordinator as a live one.
+- `wait_until_ready()` keeps its behaviour and says plainly what it is for:
+  peers built on zenode, not the stack. For the rest of the stack the honest
+  signal is the data — a safety latch arriving means the safety node is up.
 
 ### Added
 
@@ -126,7 +145,12 @@ recovery phase machine, and publishes the one authority on `safety/state`.
 - **`StateView.localization` was never populated.** The field was documented
   and typed, and nothing subscribed to `localization/pose`. Navigation goals are
   expressed in that frame, so a caller reading `state.odometry` instead was
-  reasoning in the drifting one.
+  reasoning in the drifting one. Which of the two to measure against is a real
+  choice, now that both arrive: `examples/client_drive.py` says why it keeps
+  odometry for a two-metre drive.
+- **`RobotClient.halt()` claimed more than it does.** It stops this client's
+  contribution — a higher-ranking source keeps driving and a navigation task
+  keeps running — where the docstring pointed at it as a lesser e-stop.
 
 ### Arbitration is the motion gateway, not an arbiter
 

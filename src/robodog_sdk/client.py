@@ -19,7 +19,7 @@ import time
 from collections.abc import AsyncIterator, Sequence
 from typing import TYPE_CHECKING, Generic, TypeVar
 
-from zenode import Node, TransportConfig
+from zenode import Node, ServiceError, ServiceTimeout, TransportConfig
 from zenode.service import call_service
 
 from .msgs.motion import (
@@ -76,6 +76,15 @@ NAV_CALL_TIMEOUT = 6.0
 #: How many finished tasks the client keeps results for, so that
 #: :meth:`RobotClient.wait_for_task` works when called after the fact.
 NAV_RESULT_HISTORY = 32
+
+#: Task id :meth:`RobotClient.wait_for_nav` asks after. It is a question the
+#: coordinator can only answer if it is running, and one no real task can
+#: collide with — ids are hex, and this is not.
+_NAV_PROBE_ID = "robodog-sdk-liveness-probe"
+
+#: Per-attempt timeout for that probe. Short: an answer either comes back
+#: promptly or the node is not there, and a long wait only delays the retry.
+_NAV_PROBE_TIMEOUT = 1.0
 
 
 class Latest(Generic[T]):
@@ -317,7 +326,12 @@ class RobotClient:
         self._move.put(MovementCommand(x=x, y=y, z_deg=z_deg, source=self._source))
 
     def halt(self) -> None:
-        """Command zero velocity. See :meth:`emergency_stop` for the e-stop."""
+        """Command zero velocity from this client, and nothing more.
+
+        It stops *this* client's contribution: a higher-ranking source keeps
+        driving, and a navigation task keeps running. :meth:`emergency_stop`
+        is the one that stops everything.
+        """
         self._move.put(MovementCommand(source=self._source))
 
     @contextlib.asynccontextmanager
@@ -595,7 +609,10 @@ class RobotClient:
 
         Raises:
             zenode.ServiceError: The coordinator has no record of this task.
-            zenode.ServiceTimeout: Nothing answered on the status key.
+            zenode.ServiceTimeout: Nothing answered on the status key. Note
+                that this *subclasses* ``ServiceError``, so catching the latter
+                alone cannot tell "nav says it never heard of it" from "nav is
+                not running". Catch this one first when the difference matters.
         """
         return await self._node.call(
             task_status_service(task_id),
@@ -633,9 +650,23 @@ class RobotClient:
     async def wait_until_ready(self, *nodes: str, timeout: float = 10.0) -> None:
         """Wait until the named nodes hold presence tokens.
 
-        Only zenode nodes hold one, so this answers "is that node up" for the
-        parts of the stack built on zenode and nothing at all for the rest.
-        There is no default: which nodes your behaviour needs is your
+        .. warning::
+
+           **No node of the control stack holds one.** Presence is a zenode
+           liveliness token at ``<ns>/node/<name>``, and the stack's nodes are
+           plain Zenoh applications — nav, the motion gateway, the safety
+           aggregator and the robot bridge are all invisible to this. Waiting
+           for ``"nav"`` here does not wait; it times out after ``timeout`` and
+           raises, whether or not nav is running.
+
+        So this is for waiting on *peers* — other nodes built on zenode, yours
+        or a teammate's. To wait for the navigation coordinator, use
+        :meth:`wait_for_nav`, which asks it a question instead of looking for a
+        token it does not hold. For the rest of the stack the honest signal is
+        the data itself: :attr:`state.safety <StateView.safety>` arriving means
+        the safety node is up, and a pose means the bridge is.
+
+        There is no default node name: which peers your behaviour needs is your
         behaviour's business, and waiting for the wrong one is worse than not
         waiting.
 
@@ -650,6 +681,44 @@ class RobotClient:
         if not nodes:
             raise ValueError("wait_until_ready() needs at least one node name")
         await self._node.wait_for_nodes(list(nodes), timeout=timeout)
+
+    async def wait_for_nav(self, *, timeout: float = 10.0, poll: float = 0.5) -> None:
+        """Wait until the navigation coordinator is answering.
+
+        The coordinator holds no presence token, so this asks it something
+        instead: the status of a task that cannot exist. A running coordinator
+        answers that on the error channel — it has no such task — and that
+        refusal *is* the liveness signal, because only a running one can
+        produce it. Silence means nothing is serving the key.
+
+        Args:
+            timeout: Seconds to keep asking for.
+            poll: Seconds between attempts.
+
+        Raises:
+            TimeoutError: Nothing answered the status key within ``timeout``.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                await self._node.call(
+                    task_status_service(_NAV_PROBE_ID),
+                    TaskStatusRequest(task_id=_NAV_PROBE_ID),
+                    timeout=_NAV_PROBE_TIMEOUT,
+                )
+            except ServiceTimeout:
+                pass  # nobody is serving the key yet
+            except ServiceError:
+                # "no such task" — which only a live coordinator says. This
+                # clause must stay below ServiceTimeout, which subclasses it:
+                # the other order catches silence too and reports a coordinator
+                # that is not there as one that is.
+                return
+            else:
+                return  # answered with a result, which is stranger but still up
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"navigation coordinator did not answer within {timeout}s")
+            await asyncio.sleep(poll)
 
     # ------------------------------------------------------------- lifecycle
 

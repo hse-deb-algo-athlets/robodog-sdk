@@ -1,20 +1,13 @@
-"""Navigate a route, and react to how it ends.
+"""Navigation as a task: submit a goal, then wait for its outcome.
 
     uv run python examples/navigate.py
 
-Navigation is a task, not a command: the submit returns an id and the outcome
-arrives later, on that id's result key. This example shows the two halves of
-that separately —
+Two stages, one per call style. ``navigate_to`` submits and waits; ``submit``
+returns a handle, leaving the wait to the caller.
 
-- ``navigate_to`` submits and waits, which is the short form and enough for
-  most scripts;
-- the second leg submits without waiting, watches ``state.nav`` while the task
-  runs, and collects the result afterwards.
-
-A task can end in four ways and only one of them is arrival. ``BLOCKED`` in
-particular is not an error: the skill met the world and stopped. Deciding what
-to do about it — wait, route around, ask a human — is the caller's job, which
-is why the client returns the result rather than raising.
+A task ends in one of four states and only ``SUCCEEDED`` is arrival.
+``BLOCKED`` is an outcome, not an error, so the client returns it rather than
+raising.
 """
 
 from __future__ import annotations
@@ -35,9 +28,8 @@ from robodog_sdk import (
 class RouteConfig(NodeConfig):
     """Configuration, loaded from ``[node.navigate]``."""
 
-    #: Seconds to wait for each leg. None would wait forever, which is right
-    #: for a skill that waits out an obstacle and wrong for an example.
-    leg_timeout: float = 120.0
+    #: Seconds to wait for each stage before giving up on it.
+    stage_timeout: float = 120.0
 
 
 class Navigate(Node):
@@ -51,60 +43,63 @@ class Navigate(Node):
         self.spawn(self._run_route(), name="route")
 
     async def _run_route(self) -> None:
-        await self.robot.wait_until_ready("nav", timeout=5.0)
+        # Not wait_until_ready("nav"): the coordinator holds no zenode presence
+        # token, so that call times out even when nav is running.
+        try:
+            await self.robot.wait_for_nav(timeout=5.0)
+        except TimeoutError:
+            self.log.error("no navigation coordinator answered — is the nav node running?")
+            self.stop()
+            return
 
-        # Leg one: submit and wait. Anything that is not SUCCEEDED ends the run
-        # — there is no point driving leg two from somewhere we did not reach.
-        first = await self.robot.navigate_to(2.0, 0.0, timeout=self.config.leg_timeout)
-        self._report("leg 1", first)
+        # Stage one: submit and wait. Stage two starts from where this ends, so
+        # anything other than SUCCEEDED ends the run.
+        first = await self.robot.navigate_to(0, 0.0, timeout=self.config.stage_timeout)
+        self._report("stage 1", first)
         if not first.succeeded:
             self.stop()
             return
 
-        # Leg two: the same thing taken apart, so the wait is ours to spend.
-        handle = await self.robot.submit(self._leg_two_goal())
+        # Stage two: submit and wait separately, so the wait is ours to spend.
+        handle = await self.robot.submit(self._stage_two_goal())
         if not handle.accepted:
-            self.log.error("leg 2 refused: %s", handle.reason)
+            self.log.error("stage 2 refused: %s", handle.reason)
             self.stop()
             return
 
         watcher = self.spawn(self._watch(), name="watch")
         try:
-            second = await self.robot.wait_for_task(handle.task_id, timeout=self.config.leg_timeout)
+            second = await self.robot.wait_for_task(
+                handle.task_id, timeout=self.config.stage_timeout
+            )
         except TimeoutError:
-            # The task is still running: the wait timed out, not the robot.
-            # Stopping it is a separate decision, and an explicit one.
-            self.log.warning("leg 2 outran its timeout — cancelling")
+            # The wait timed out, not the task: cancelling is a separate call.
+            self.log.warning("stage 2 outran its timeout — cancelling")
             await self.robot.cancel_task(handle.task_id)
             second = await self.robot.wait_for_task(handle.task_id, timeout=5.0)
         finally:
             watcher.cancel()
 
-        self._report("leg 2", second)
+        self._report("stage 2", second)
         self.stop()
 
     @staticmethod
-    def _leg_two_goal() -> NavigateThroughPosesGoal:
-        # waypoint_follow drives the route it is given. A planning skill is
-        # free to treat the intermediate poses as advisory and cut the corner,
-        # which is not what a route is for.
-        #
-        # The corridor is the other half of meaning it: if a human takes the
-        # gamepad mid-leg and lets go more than half a metre off this line,
-        # the task ends BLOCKED rather than resuming from wherever it now is.
+    def _stage_two_goal() -> NavigateThroughPosesGoal:
+        # waypoint_follow drives the route as given; a planning skill may treat
+        # the intermediate poses as advisory and cut the corner. The corridor
+        # bounds a manual takeover: handed back more than 0.5 m off this line,
+        # the task ends BLOCKED instead of resuming.
         return NavigateThroughPosesGoal(
-            poses=[Pose2D(x=2.0, y=1.5, theta=0.0), Pose2D(x=0.0, y=1.5, theta=0.0)],
+            poses=[Pose2D(x=1, y=1, theta=0.0), Pose2D(x=0.0, y=1.5, theta=0.0)],
             skill="waypoint_follow",
             corridor_deviation_m=0.5,
         )
 
     async def _watch(self) -> None:
-        """Log progress while a task runs. Feedback is not latched, so a gap
-        here means the skill stopped publishing, not that it finished.
+        """Log task progress.
 
-        ``state`` is RUNNING for the whole leg and says nothing useful here;
-        ``activity`` is the field that moves. A stall is not a failure — the
-        skill is still trying — so this reports it and keeps waiting.
+        ``state`` is RUNNING throughout; ``activity`` is the field that moves.
+        A stall is transient, so this reports it and keeps waiting.
         """
         while True:
             feedback = self.robot.state.nav.value
@@ -122,13 +117,13 @@ class Navigate(Node):
                 )
             await asyncio.sleep(1.0)
 
-    def _report(self, leg: str, result: TaskResult) -> None:
+    def _report(self, stage: str, result: TaskResult) -> None:
         if result.state is TaskState.SUCCEEDED:
-            self.log.info("%s arrived", leg)
+            self.log.info("%s arrived", stage)
         elif result.state is TaskState.BLOCKED:
-            self.log.warning("%s blocked: %s", leg, result.message)
+            self.log.warning("%s blocked: %s", stage, result.message)
         else:
-            self.log.error("%s ended %s: %s", leg, result.state.value, result.message)
+            self.log.error("%s ended %s: %s", stage, result.state.value, result.message)
 
 
 def cli() -> None:

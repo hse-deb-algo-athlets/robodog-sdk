@@ -149,7 +149,7 @@ arrival, and `BLOCKED` is not an error: the robot met the world and stopped.
 Check the result, do not assume it.
 
 **A task's lifecycle and what the skill is doing are different questions.**
-`TaskFeedback.state` is `RUNNING` for the whole leg and never anything else —
+`TaskFeedback.state` is `RUNNING` for the whole task and never anything else —
 the terminal verdict lives only on the result key, so the two can never
 disagree. What moves is `activity`: `cruising`, `aligning`, `stalled`,
 `retreating`. A stall is transient and the skill is still trying; only a

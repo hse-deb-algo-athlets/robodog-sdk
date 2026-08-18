@@ -3,20 +3,15 @@
     uv run python examples/contract_drive.py
 
 Equivalent to ``client_drive.py``, written against ``Topic`` declarations
-rather than :class:`~robodog_sdk.RobotClient`. Compare the two to see what the
-client provides.
-
-Handled explicitly here:
+rather than :class:`~robodog_sdk.RobotClient`. Handled explicitly here:
 
 - Republishing. A command expires after ``COMMAND_MAX_AGE``, so sustained
-  motion requires a timer rather than a single ``put()``.
-- Stopping on shutdown. ``on_stop`` publishes zero velocity; without it the
-  robot continues until the deadman elapses.
-- The command's rank. ``source=autonomous`` is what makes the gateway hand the
-  robot to a human the moment one touches the gamepad, and it is carried on
-  every frame rather than agreed once.
-- Trace continuity across the timer. ``state/odometry`` is a trace root, but a
-  timer body runs outside any trace, so the pose's context is captured in the
+  motion needs a timer rather than a single ``put()``.
+- Stopping on shutdown, in ``on_stop``; without it the robot runs until the
+  deadman elapses.
+- The command's rank, carried on every frame as ``source=autonomous``.
+- Trace continuity. ``system_state/odometry`` is a trace root, but a timer
+  body runs outside any trace, so the pose's context is captured in the
   handler and restored before publishing.
 """
 
@@ -51,11 +46,11 @@ class ContractDrive(Node):
 
     #: Materialized before ``on_start`` and usable from it. The gateway inlet,
     #: not ``move``: that key is the gateway's output, and publishing there
-    #: would bypass both arbitration and the collision zones.
+    #: bypasses both arbitration and the collision zones.
     cmd = publish(MotionTopics.request)
 
     # Declared here, assigned in on_start: plain state needs no session, but
-    # declaring it keeps the node's attributes discoverable in one place.
+    # declaring it keeps the node's attributes in one place.
     _origin: tuple[float, float] | None
     _travelled: float
     _blocked: bool
@@ -87,13 +82,15 @@ class ContractDrive(Node):
     async def tick(self) -> None:
         if self._origin is None:
             return  # no pose yet — publishing would be driving blind
-        # A timer is caused by the clock, not by a message, so it runs outside
-        # any trace. Restoring the pose's context keeps the command linked to
-        # the measurement it was derived from.
+        # A timer is caused by the clock, not a message, so it runs outside any
+        # trace. Restoring the pose's context keeps the command linked to the
+        # measurement it came from.
         with trace.using(self._pose_trace):
             if self._blocked or self._travelled >= self.config.distance:
                 self.cmd.put(MovementCommand(source=MovementSource.autonomous))
-                return
+                self.log.info("drive stopped after %.2f m", self._travelled)
+                self.stop()
+                return  # without this the zero command is undone on the next line
             self.cmd.put(MovementCommand(x=self.config.speed, source=MovementSource.autonomous))
 
     async def on_stop(self) -> None:

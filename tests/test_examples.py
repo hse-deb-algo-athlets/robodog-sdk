@@ -98,27 +98,27 @@ async def test_examples_publish_on_the_inlet_never_the_gateway_output() -> None:
         assert all(c.source is MovementSource.autonomous for c in stack.commands)
 
 
-async def test_navigate_runs_both_legs_and_stops() -> None:
+async def test_navigate_runs_both_stages_and_stops() -> None:
     async with harness() as h:
         await h.start_node(FakeStack)
         nav = await h.start_node(FakeNav)
-        await h.start_node(navigate.Navigate, config=navigate.RouteConfig(leg_timeout=5.0))
+        await h.start_node(navigate.Navigate, config=navigate.RouteConfig(stage_timeout=5.0))
 
         for _ in range(50):
             if len(nav.goals) >= 2:
                 break
             await asyncio.sleep(0.05)
 
-        assert len(nav.goals) == 2, "both legs should have been submitted"
+        assert len(nav.goals) == 2, "both stages should have been submitted"
         assert nav.goals[1].skill == "waypoint_follow"
 
 
-async def test_navigate_abandons_the_route_when_the_first_leg_blocks() -> None:
+async def test_navigate_abandons_the_route_when_the_first_stage_blocks() -> None:
     async with harness() as h:
         await h.start_node(FakeStack)
         nav = await h.start_node(FakeNav)
         nav.result_state = TaskState.BLOCKED
-        await h.start_node(navigate.Navigate, config=navigate.RouteConfig(leg_timeout=5.0))
+        await h.start_node(navigate.Navigate, config=navigate.RouteConfig(stage_timeout=5.0))
 
         await asyncio.sleep(SETTLE + 0.3)
-        assert len(nav.goals) == 1, "a blocked first leg must not start the second"
+        assert len(nav.goals) == 1, "a blocked first stage must not start the second"
