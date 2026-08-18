@@ -25,8 +25,6 @@ from zenode.service import call_service
 from .msgs.motion import (
     ActionCommand,
     ActionType,
-    EmergencyStop,
-    EmergencyStopCommand,
     MotionGatewayStatus,
     MovementCommand,
     MovementSource,
@@ -35,6 +33,7 @@ from .msgs.motion import (
 from .msgs.navigation import (
     CancelAck,
     CancelRequest,
+    EstopPolicy,
     NavigateThroughPosesGoal,
     NavigateToPoseGoal,
     Pose2D,
@@ -46,8 +45,11 @@ from .msgs.navigation import (
     TaskStatusRequest,
 )
 from .msgs.robot import BatteryState, OdometryState, RobotHighState
+from .msgs.safety import ButtonEvent, SafetyState
+from .msgs.system_state import SystemState
 from .topics import (
     ControlTopics,
+    LocalizationTopics,
     MotionTopics,
     NavServices,
     NavTopics,
@@ -111,14 +113,20 @@ class Latest(Generic[T]):
 class StateView:
     """Robot state as last received by this process.
 
-    Every field is a :class:`Latest`. All but :attr:`nav` are backed by latched
-    topics, so they are populated shortly after the client is created rather
-    than on the next publish; navigation feedback exists only while a task
-    runs, so its age is what tells you whether one does.
+    Every field is a :class:`Latest`, and age is exposed rather than hidden
+    because most of these are only as true as they are recent. The robot state
+    streams continuously, so a stale value means the producer stopped;
+    navigation feedback exists only while a task runs, so its age is what tells
+    you whether one does; the gateway and safety values are edge-published, so
+    their age is the time since the last *change* and says nothing about
+    liveness.
     """
 
     def __init__(self) -> None:
+        #: Raw odometry off the robot — where it thinks it has driven to.
         self.odometry: Latest[OdometryState] = Latest()
+        #: The fused pose, from SLAM or the odometry fallback. This is the one
+        #: navigation goals are expressed in; :attr:`odometry` drifts.
         self.localization: Latest[OdometryState] = Latest()
         self.battery: Latest[BatteryState] = Latest()
         self.highstate: Latest[RobotHighState] = Latest()
@@ -128,6 +136,14 @@ class StateView:
         #: their command. Edge-published, so its age is the time since the last
         #: change, not the time since the last tick.
         self.gateway: Latest[MotionGatewayStatus] = Latest()
+        #: The safety latch — the authority on whether the robot may move at
+        #: all. Republished on a heartbeat as well as on change, so unlike the
+        #: gateway status its age *is* meaningful: see
+        #: :attr:`RobotClient.motion_permitted`.
+        self.safety: Latest[SafetyState] = Latest()
+        #: The composite state: nav activity, control mode, order and posture
+        #: in one payload, plus the headline derived from them.
+        self.system: Latest[SystemState] = Latest()
 
 
 class RobotClient:
@@ -163,14 +179,18 @@ class RobotClient:
         self.state = StateView()
 
         self._move = node.publisher(MotionTopics.request)
-        self._estop = node.publisher(SafetyTopics.estop)
+        self._cancel_button = node.publisher(SafetyTopics.cancel)
         self._action = node.publisher(PoseTopics.action)
         self._tilt = node.publisher(PoseTopics.tilt_body)
+        self._cancel_seq = 0
 
         node.subscribe(StateTopics.odometry, self.state.odometry.update, mode="latest")
+        node.subscribe(LocalizationTopics.pose, self.state.localization.update, mode="latest")
         node.subscribe(StateTopics.battery, self.state.battery.update, mode="latest")
         node.subscribe(StateTopics.highstate, self.state.highstate.update, mode="latest")
+        node.subscribe(StateTopics.system, self.state.system.update, mode="latest")
         node.subscribe(ControlTopics.status, self.state.gateway.update, mode="latest")
+        node.subscribe(SafetyTopics.state, self.state.safety.update, mode="latest")
         # Both wildcards, and both declared here rather than per task: a result
         # is published once and is not latched, so a subscription declared
         # after the submit returns can miss a task that failed immediately.
@@ -257,6 +277,26 @@ class RobotClient:
         status = self.state.gateway.value
         return list(status.active_zones) if status is not None else []
 
+    def motion_permitted(self, *, within: float = 2.0) -> bool:
+        """Whether the safety authority currently permits motion.
+
+        Fails safe on silence, which is the whole point of asking: a latch that
+        stopped arriving is treated exactly like one that says stopped, so a
+        crashed safety node or a severed link cannot read as permission. That
+        is why this is a method taking a freshness window rather than a
+        property — the answer depends on *when* the last frame arrived, not
+        only on what it said.
+
+        Args:
+            within: Seconds. A latch older than this counts as absent. The
+                safety node republishes on a heartbeat, so a value well above
+                that interval still catches a genuine outage.
+        """
+        latch = self.state.safety.value
+        if latch is None or not self.state.safety.fresh(within=within):
+            return False
+        return latch.motion_permitted
+
     # -------------------------------------------------------------- commands
 
     def move(self, x: float = 0.0, y: float = 0.0, z_deg: float = 0.0) -> None:
@@ -321,12 +361,22 @@ class RobotClient:
         self._tilt.put(TiltBody(pitch_deg=pitch_deg, roll_deg=roll_deg, yaw_deg=yaw_deg))
 
     def emergency_stop(self) -> None:
-        """Trigger the emergency stop.
+        """Stop the robot now, and abandon whatever it was doing.
 
-        There is no counterpart: an e-stop is cleared at the physical button,
-        not through this API.
+        Publishes the cancel button event that the safety node, the navigation
+        coordinator and the fleet bridge each subscribe to on their own: the
+        robot is commanded to zero, the running navigation task is cancelled,
+        and any order runtime is wiped. Each is done by its owner, so none of
+        it depends on this process staying alive afterwards.
+
+        This is the *software* stop and there is no counterpart to it, because
+        it does not latch. Only the physical switch latches — engaging it is
+        what puts :attr:`StateView.safety` into a stopped phase, and only the
+        release press on the panel clears that. Software can stop the robot;
+        it cannot pretend to be the button.
         """
-        self._estop.put(EmergencyStopCommand(command=EmergencyStop.stop))
+        self._cancel_seq += 1
+        self._cancel_button.put(ButtonEvent(source_id=self._node.name, seq=self._cancel_seq))
 
     # ------------------------------------------------------------ navigation
 
@@ -340,6 +390,7 @@ class RobotClient:
         max_speed: float | None = None,
         skill: str | None = None,
         preempt: bool = False,
+        on_estop: EstopPolicy = EstopPolicy.CANCEL,
     ) -> TaskResult:
         """Navigate to a point and wait for the task to finish.
 
@@ -358,6 +409,10 @@ class RobotClient:
             skill: Skill to run the goal. ``None`` uses the deployment default.
             preempt: Displace a task that is already running. Without it a
                 submit made while the robot is navigating is refused.
+            on_estop: What an emergency stop does to this task. The default
+                discards it; :attr:`EstopPolicy.HOLD` keeps it and resumes
+                once motion is permitted again, which is only right if this
+                call is still there to see the outcome.
 
         Returns:
             The terminal :class:`TaskResult`. Check ``result.succeeded``, or
@@ -380,7 +435,7 @@ class RobotClient:
             max_speed=max_speed,
             skill=skill,
         )
-        return await self.run_goal(goal, timeout=timeout, preempt=preempt)
+        return await self.run_goal(goal, timeout=timeout, preempt=preempt, on_estop=on_estop)
 
     async def navigate_through(
         self,
@@ -391,6 +446,8 @@ class RobotClient:
         max_speed: float | None = None,
         skill: str | None = None,
         preempt: bool = False,
+        on_estop: EstopPolicy = EstopPolicy.CANCEL,
+        corridor_deviation_m: float | None = None,
     ) -> TaskResult:
         """Navigate a route through several poses and wait for the outcome.
 
@@ -405,6 +462,12 @@ class RobotClient:
                 intermediate ones — pass ``"waypoint_follow"`` when the route
                 is the point.
             preempt: As :meth:`navigate_to`.
+            on_estop: As :meth:`navigate_to`.
+            corridor_deviation_m: Half-width in metres of the corridor around
+                the route that a human may drive the robot out of and still
+                have it resume. ``None`` lets it resume from anywhere, which
+                is fine for a route that was a convenience and wrong for one
+                that was a decision.
         """
         goal = NavigateThroughPosesGoal(
             poses=[
@@ -413,11 +476,17 @@ class RobotClient:
             final_orientation=final_heading,
             max_speed=max_speed,
             skill=skill,
+            corridor_deviation_m=corridor_deviation_m,
         )
-        return await self.run_goal(goal, timeout=timeout, preempt=preempt)
+        return await self.run_goal(goal, timeout=timeout, preempt=preempt, on_estop=on_estop)
 
     async def run_goal(
-        self, goal: TaskGoal, *, timeout: float | None = None, preempt: bool = False
+        self,
+        goal: TaskGoal,
+        *,
+        timeout: float | None = None,
+        preempt: bool = False,
+        on_estop: EstopPolicy = EstopPolicy.CANCEL,
     ) -> TaskResult:
         """Submit a goal and wait for its result. Submit plus wait, in one call.
 
@@ -425,14 +494,20 @@ class RobotClient:
             PermissionError: The goal was not accepted.
             TimeoutError: No terminal state arrived within ``timeout``.
         """
-        handle = await self.submit(goal, preempt=preempt)
+        handle = await self.submit(goal, preempt=preempt, on_estop=on_estop)
         if not handle.accepted:
             raise PermissionError(
                 f"navigation goal not accepted: {handle.reason or 'no reason given'}"
             )
         return await self.wait_for_task(handle.task_id, timeout=timeout)
 
-    async def submit(self, goal: TaskGoal, *, preempt: bool = False) -> TaskHandle:
+    async def submit(
+        self,
+        goal: TaskGoal,
+        *,
+        preempt: bool = False,
+        on_estop: EstopPolicy = EstopPolicy.CANCEL,
+    ) -> TaskHandle:
         """Submit a goal without waiting for it to finish.
 
         For fire-and-forget navigation, and for the case where the caller wants
@@ -441,6 +516,11 @@ class RobotClient:
         subscribes to results for its whole lifetime, so waiting after the fact
         is safe.
 
+        Args:
+            goal: What to do.
+            preempt: Displace a task that is already running.
+            on_estop: What an emergency stop does to this task.
+
         Returns:
             The coordinator's :class:`TaskHandle`. ``accepted=False`` is an
             ordinary answer here, not an exception — unlike :meth:`run_goal`.
@@ -448,12 +528,14 @@ class RobotClient:
         Raises:
             zenode.ServiceTimeout: Nothing answered on the submit key.
         """
-        # preempt travels as a query parameter rather than in the payload, so
+        # Both knobs travel as query parameters rather than in the payload, so
         # the goal on the wire stays exactly the goal. zenode has no API for
-        # query parameters, hence the selector built by hand here.
-        key = NavServices.submit.resolve(self._node.namespace)
+        # query parameters, hence the selector built by hand here. The client
+        # name goes along for the coordinator's logs.
+        params = [f"client={self._node.name}", f"on_estop={on_estop.value}"]
         if preempt:
-            key = f"{key}?preempt=true"
+            params.append("preempt=true")
+        key = NavServices.submit.resolve(self._node.namespace) + "?" + "&".join(params)
         return await call_service(
             self._node.session,
             NavServices.submit,
@@ -501,12 +583,18 @@ class RobotClient:
     async def task_status(self, task_id: str) -> TaskResult:
         """Ask the coordinator what became of a task.
 
-        For a process that did not watch the task itself. The reply is
-        :attr:`TaskState.PENDING` for a task the coordinator does not know —
-        including one it has already forgotten — so a ``PENDING`` answer means
-        "no information", not "queued".
+        For a process that did not watch the task itself. The answer is
+        terminal for a task that finished and :attr:`TaskState.RUNNING` for one
+        still under way, so — unlike a payload from the result key — check
+        ``state.is_terminal`` before treating it as an outcome.
+
+        A task the coordinator has no record of, whether it was never submitted
+        or has since aged out of its bounded history, is answered on the Zenoh
+        error channel and raises. "Unknown" is not a lifecycle state, and this
+        call will not invent one for you.
 
         Raises:
+            zenode.ServiceError: The coordinator has no record of this task.
             zenode.ServiceTimeout: Nothing answered on the status key.
         """
         return await self._node.call(

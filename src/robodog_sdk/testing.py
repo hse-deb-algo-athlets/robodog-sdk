@@ -36,6 +36,7 @@ from .msgs.motion import (
 from .msgs.navigation import (
     CancelAck,
     CancelRequest,
+    NavActivity,
     NavigateThroughPosesGoal,
     NavigateToPoseGoal,
     Pose2D,
@@ -44,12 +45,17 @@ from .msgs.navigation import (
     TaskHandle,
     TaskResult,
     TaskState,
+    TaskStatusRequest,
 )
 from .msgs.robot import BatteryLevel, BatteryState, OdometryState
+from .msgs.safety import ButtonEvent, EstopPhase, SafetyState
+from .msgs.system_state import ControlMode, Posture, SystemState
 from .topics import (
     ControlTopics,
+    LocalizationTopics,
     MotionTopics,
     NavServices,
+    SafetyTopics,
     StateTopics,
     task_feedback_topic,
     task_result_topic,
@@ -61,7 +67,8 @@ class FakeNav(Node):
 
     One task at a time, as in the real coordinator. A submit while a task is
     running cancels that task first — the double cannot see the ``preempt``
-    query parameter that decides this in the stack, so it always preempts.
+    query parameter that decides this in the stack, and for the same reason it
+    cannot see ``on_estop`` either, so it always preempts and never holds.
     Set :attr:`accept` to ``False`` to make the next submit be refused instead,
     which is how a test covers the "refused" branch.
 
@@ -70,6 +77,7 @@ class FakeNav(Node):
     ``False`` and drive the ending yourself::
 
         nav.auto_finish = False
+        nav.activity = NavActivity.STALLED
         ...
         nav.finish(TaskState.BLOCKED, "door did not open")
     """
@@ -89,6 +97,9 @@ class FakeNav(Node):
     auto_finish: bool
     #: Feedback publish period, seconds.
     feedback_period: float
+    #: Sub-state stamped on every feedback frame. Assign to it mid-task to
+    #: make the node under test see the skill stall or back off.
+    activity: NavActivity
 
     async def on_start(self) -> None:
         self.goals = []
@@ -97,9 +108,11 @@ class FakeNav(Node):
         self.duration = 0.05
         self.auto_finish = True
         self.feedback_period = 0.02
+        self.activity = NavActivity.CRUISING
         self._active_id: str | None = None
         self._finished: asyncio.Event = asyncio.Event()
         self._ending: TaskResult | None = None
+        self._results: dict[str, TaskResult] = {}
 
     @property
     def active_task_id(self) -> str | None:
@@ -141,19 +154,42 @@ class FakeNav(Node):
         self.finish(TaskState.CANCELED, "canceled by client")
         return CancelAck(task_id=request.task_id, canceled=True)
 
+    @serve(NavServices.status)
+    async def on_status(self, request: TaskStatusRequest) -> TaskResult:
+        """Answer a late poll, and raise for a task this double never ran.
+
+        The real coordinator reads the task id off the key and answers an
+        unknown one on the Zenoh error channel. Raising here produces the same
+        error reply, so a test sees the exception a client will really get; the
+        id is taken from the payload because a served handler is not given the
+        key it was called on.
+        """
+        recorded = self._results.get(request.task_id)
+        if recorded is not None:
+            return recorded
+        if request.task_id == self._active_id:
+            return TaskResult(
+                task_id=request.task_id,
+                state=TaskState.RUNNING,
+                message="no terminal result recorded yet",
+            )
+        raise LookupError(f"no task '{request.task_id}' on record")
+
     async def _run(self, task_id: str, goal: object) -> None:
         feedback = self.publisher(task_feedback_topic(task_id))
         result = self.publisher(task_result_topic(task_id))
         target = _goal_target(goal)
+        total = _goal_segments(goal)
         elapsed = 0.0
         while not self._finished.is_set():
             feedback.put(
                 TaskFeedback(
                     task_id=task_id,
-                    state=TaskState.RUNNING,
                     current_pose=target,
                     distance_to_goal=0.0,
                     active_skill="fake",
+                    activity=self.activity,
+                    total_segments=total,
                 )
             )
             if self.auto_finish and elapsed >= self.duration:
@@ -164,6 +200,7 @@ class FakeNav(Node):
             elapsed += self.feedback_period
         ending = self._ending or TaskResult(task_id=task_id, state=self.result_state)
         self._active_id = None
+        self._results[task_id] = ending
         result.put(ending)
 
 
@@ -175,6 +212,10 @@ def _goal_target(goal: object) -> Pose2D | None:
     return None
 
 
+def _goal_segments(goal: object) -> int | None:
+    return len(goal.poses) if isinstance(goal, NavigateThroughPosesGoal) else None
+
+
 class FakeStack(Node):
     """Publishes latched robot state and records commands sent to the gateway."""
 
@@ -182,30 +223,93 @@ class FakeStack(Node):
     health_interval = None
 
     odometry = publish(StateTopics.odometry)
+    localization = publish(LocalizationTopics.pose)
     battery = publish(StateTopics.battery)
+    system = publish(StateTopics.system)
     gateway = publish(ControlTopics.status)
+    safety = publish(SafetyTopics.state)
 
     #: Every ``MovementCommand`` seen on the gateway inlet, in order and from
     #: every source. The double does not arbitrate — it records.
     commands: list[MovementCommand]
+    #: Every cancel button event seen, in order. This is what
+    #: :meth:`~robodog_sdk.RobotClient.emergency_stop` sends; the double
+    #: records it rather than acting on it, so a test can assert that a node
+    #: asked for the stop without the double having to model the recovery.
+    cancels: list[ButtonEvent]
 
     async def on_start(self) -> None:
         self.commands = []
+        self.cancels = []
         self.odometry.put(OdometryState())
+        self.localization.put(OdometryState())
         self.battery.put(BatteryState(soc=87, level=BatteryLevel.good, voltage=28.4))
         self.gateway.put(MotionGatewayStatus(active_source=None))
+        self.system.put(SystemState(posture=Posture.STANDING))
+        # Explicitly permissive. The defaults on SafetyState are fail-safe —
+        # stopped, no live source — so a double that published one unmodified
+        # would leave every node under test refusing to move.
+        self.safety.put(SafetyState(estop=False, source_alive=True, phase=EstopPhase.CLEAR))
 
     @subscribe(MotionTopics.request)
     async def on_movement_request(self, msg: MovementCommand) -> None:
         self.commands.append(msg)
 
+    @subscribe(SafetyTopics.cancel)
+    async def on_cancel_button(self, msg: ButtonEvent) -> None:
+        self.cancels.append(msg)
+
     def set_pose(self, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> None:
-        """Publish a new pose. The transition is instantaneous."""
-        self.odometry.put(OdometryState(x=x, y=y, z=z))
+        """Publish a new pose, on both the odometry and localization keys.
+
+        The transition is instantaneous, and the two agree exactly — which the
+        real ones will not, since odometry drifts and the fused pose is what
+        corrects it. Test a node's handling of that disagreement by driving
+        :attr:`localization` directly.
+        """
+        pose = OdometryState(x=x, y=y, z=z)
+        self.odometry.put(pose)
+        self.localization.put(pose)
 
     def set_battery(self, soc: int, level: BatteryLevel = BatteryLevel.good) -> None:
         """Publish a new battery state."""
         self.battery.put(BatteryState(soc=soc, level=level))
+
+    def set_safety(
+        self,
+        *,
+        estop: bool = False,
+        source_alive: bool = True,
+        phase: EstopPhase = EstopPhase.CLEAR,
+    ) -> None:
+        """Publish a safety latch — whether the robot may move, and why not.
+
+        The parameters are independent on purpose, because in the stack they
+        are: ``phase`` carries the story an operator needs while ``estop`` and
+        ``source_alive`` decide the answer. To make a node see a pressed
+        button::
+
+            stack.set_safety(estop=True, phase=EstopPhase.STOPPED)
+
+        and to make it see the safety source disappear, which stops just as
+        hard for an entirely different reason::
+
+            stack.set_safety(source_alive=False, phase=EstopPhase.SOURCE_LOST)
+        """
+        self.safety.put(SafetyState(estop=estop, source_alive=source_alive, phase=phase))
+
+    def set_system(
+        self,
+        *,
+        control: ControlMode = ControlMode.AUTO,
+        posture: Posture = Posture.STANDING,
+        nav: NavActivity = NavActivity.NONE,
+        safety_phase: EstopPhase = EstopPhase.CLEAR,
+    ) -> None:
+        """Publish a composite state. ``headline`` is derived, not passed in."""
+        self.system.put(
+            SystemState(control=control, posture=posture, nav=nav, safety_phase=safety_phase)
+        )
 
     def set_driver(
         self,

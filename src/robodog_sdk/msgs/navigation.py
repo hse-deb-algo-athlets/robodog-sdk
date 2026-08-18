@@ -8,8 +8,14 @@ task is addressed by its id: :class:`TaskFeedback` while it runs,
 arrives too late to have heard either.
 
 The work itself is done by a **skill** — a named strategy inside the navigation
-node (``global_nav``, ``waypoint_follow``, ``door_traverse``, ``dummy``). A goal
-either names one or leaves the choice to the deployment default.
+node (``global_nav``, ``corridor_assist``, ``waypoint_follow``,
+``door_traverse``, ``dummy``). A goal either names one or leaves the choice to
+the deployment default.
+
+Three fields describe "what is happening" at different altitudes and are worth
+keeping apart. :class:`TaskState` is the *lifecycle* — running, or one of four
+endings. :class:`NavActivity` is the skill's transient sub-state — cruising,
+aligning, stalled. ``active_skill`` is merely which skill is driving.
 
 :class:`Pose2D` retains its vector arithmetic, which belongs to the type rather
 than to any one consumer. The planner helpers that required numpy are not
@@ -102,14 +108,18 @@ class Pose2D(BaseModel):
 class TaskState(StrEnum):
     """Where a navigation task is in its life.
 
-    The four terminal values are reported once, on the task's result key.
-    :attr:`RUNNING` is what streams on the feedback key in between.
+    :attr:`RUNNING` is what streams on the feedback key; the four terminal
+    values are reported once, on the result key. There is no queued state —
+    a submit starts the skill immediately, so a task is always either running
+    or finished.
+
+    A status query for a task the coordinator has no record of — never
+    submitted, or aged out of its bounded history — is answered on the Zenoh
+    **error channel**, not with a placeholder value here. "Unknown" is not a
+    lifecycle state, and giving it one invites a client to treat a forgotten
+    task as one about to start.
     """
 
-    #: Submitted, not yet running. The coordinator starts a task immediately,
-    #: so this is only ever seen as the answer to a status query for a task id
-    #: it does not know — see :class:`TaskResult`.
-    PENDING = "pending"
     RUNNING = "running"
     #: Terminal — the goal was reached.
     SUCCEEDED = "succeeded"
@@ -137,6 +147,49 @@ class TaskState(StrEnum):
             TaskState.CANCELED,
             TaskState.BLOCKED,
         )
+
+
+class NavActivity(StrEnum):
+    """What a running task's skill is *currently* doing.
+
+    Orthogonal to :class:`TaskState`: ``state`` stays :attr:`TaskState.RUNNING`
+    for the whole of a task's life while ``activity`` swings between these as
+    the skill drives, aligns, stalls in front of an obstacle or backs off.
+
+    :attr:`STALLED` and :attr:`RETREATING` are *transient* — the skill is still
+    trying. :attr:`BLOCKED` here mirrors a give-up in the streamed feedback;
+    the authoritative verdict is always the :class:`TaskResult` carrying
+    :attr:`TaskState.BLOCKED`.
+    """
+
+    NONE = "none"  # not steering / between phases
+    CRUISING = "cruising"  # following the path normally
+    ALIGNING = "aligning"  # rotating in place toward the path or goal heading
+    STALLED = "stalled"  # stopped in front of an obstacle, still trying
+    RETREATING = "retreating"  # backing off to the last passed waypoint
+    PAUSED = "paused"  # held by an external stop (e-stop), not by the world
+    MANUAL = "manual"  # held because a human took over on the gamepad
+    BLOCKED = "blocked"  # skill gave up — see the terminal TaskResult
+
+
+class EstopPolicy(StrEnum):
+    """What an e-stop does to a task — chosen by the client that submitted it.
+
+    Travels as the ``?on_estop=`` parameter on the submit rather than in the
+    payload: whoever submitted a task is the only one who knows whether it
+    survives a stop, so nav does not guess.
+
+    :attr:`CANCEL` is the default because most routes have no owner watching
+    them. A goal sent from a script or a map UI is a one-shot instruction, and
+    silently resuming it minutes after a human walked over and hit the button
+    is not what anyone meant by it. Pass :attr:`HOLD` only if this process
+    owns the mission and handles the recovery itself.
+    """
+
+    #: Discard the task when the e-stop engages. It will not resume.
+    CANCEL = "cancel"
+    #: Hold the task; it resumes once motion is permitted again.
+    HOLD = "hold"
 
 
 # -------------------------------------------------------------------- goals
@@ -175,6 +228,15 @@ class NavigateThroughPosesGoal(BaseModel):
     arrival_orientation_deviation: float = 0.1
     final_orientation: float | None = None
     skill: str | None = None
+    #: Half-width in metres of the released corridor around the ``poses``
+    #: polyline, for the case where a human takes the gamepad mid-route. When
+    #: they let go the skill measures how far off the line the robot ended up:
+    #: inside the corridor it resumes, beyond it the task ends
+    #: :attr:`TaskState.BLOCKED` so the client can decide what happens next.
+    #: ``None`` disables the check and the skill simply resumes from wherever
+    #: it is — which is the right answer for a one-off local goal, and the
+    #: wrong one for a fleet order whose route was chosen for a reason.
+    corridor_deviation_m: float | None = None
 
 
 #: What ``nav/task/submit`` accepts, discriminated on ``kind``.
@@ -238,8 +300,8 @@ class TaskStatusRequest(BaseModel):
     """Request payload for the per-task status query.
 
     The task is identified by the key the query goes to
-    (:func:`~robodog_sdk.topics.task_status_service`), so this carries the id
-    only for symmetry and for logs.
+    (:func:`~robodog_sdk.topics.task_status_service`), which is also all the
+    coordinator reads. This carries the id for symmetry and for logs.
     """
 
     task_id: str = ""
@@ -251,36 +313,56 @@ class TaskStatusRequest(BaseModel):
 class TaskFeedback(BaseModel):
     """Progress, published on the task's feedback key while it runs.
 
-    Roughly 10-20 Hz, driven by the skill's own control loop, so the rate is
-    the skill's and not a guarantee. Not latched: subscribe before submitting,
-    or accept that the first samples are missed.
+    Roughly 10 Hz, driven by the skill's own control loop, so the rate is the
+    skill's and not a guarantee. Not latched: subscribe before submitting, or
+    accept that the first samples are missed.
 
-    ``state`` is :attr:`TaskState.RUNNING` for the whole of a task's life —
-    the terminal state arrives on the result key, not here.
+    ``state`` is narrowed to :attr:`TaskState.RUNNING`. Feedback streams only
+    while the task is alive, so that is the only lifecycle value this key can
+    carry, and the narrowing is what makes it impossible for a feedback frame
+    and the :class:`TaskResult` to disagree — a stray terminal value on the
+    wire is rejected at validation rather than believed.
     """
 
     task_id: str
-    state: TaskState
+    state: Literal[TaskState.RUNNING] = TaskState.RUNNING
     current_pose: Pose2D | None = None
     distance_to_goal: float | None = None
-    #: Skill running this task. Skills may append a colon-separated note about
-    #: what they are doing (``"waypoint_follow:stalled 3.1s"``), so compare on
-    #: the part before the first colon.
+    #: Which skill is driving — a plain name, nothing appended. Read
+    #: :attr:`activity` for what it is doing and :attr:`note` for the prose.
     active_skill: str | None = None
+    #: The skill's transient sub-state. Machine-readable, unlike :attr:`note`.
+    activity: NavActivity = NavActivity.CRUISING
+    #: Optional human-readable detail for the current :attr:`activity`, e.g.
+    #: ``"stalled 3.1s"``. Never parse this — branch on ``activity`` instead.
+    note: str | None = None
     #: Pure-pursuit carrot point (x/y only). Diagnostic; safe to ignore.
     #: ``None`` whenever the skill is not actively steering.
     lookahead_point: Pose2D | None = None
+    #: Route progress on a multi-waypoint goal: the 0-based index of the most
+    #: recently *reached* original waypoint — ``goal.poses[i]`` of a
+    #: :class:`NavigateThroughPosesGoal`. ``None`` until the first is reached,
+    #: and for skills that do not track segments at all.
+    current_segment_index: int | None = None
+    #: How many waypoints the route has, alongside
+    #: :attr:`current_segment_index`. This pair is what lets a fleet bridge
+    #: report each node as it is passed instead of only at the end of the run.
+    total_segments: int | None = None
     timestamp: datetime = Field(default_factory=_utcnow)
 
 
 class TaskResult(BaseModel):
     """The one terminal payload for a task.
 
-    Published on the task's result key, and returned by the status query for
-    as long as the coordinator remembers the task. A status query for a task
-    it does not remember — never submitted, or evicted from its history —
-    answers :attr:`TaskState.PENDING`, so treat that as "unknown", never as
-    "about to start".
+    On the result key ``state`` is always terminal, and the message is
+    published exactly once. The status query reuses this model to answer late
+    lookups, and there it may also carry :attr:`TaskState.RUNNING` — the task
+    is still going. So a subscriber of the result key may assume terminal; a
+    caller of :func:`~robodog_sdk.topics.task_status_service` may not.
+
+    A lookup for a task the coordinator has no record of is answered on the
+    Zenoh error channel and surfaces as an exception, never as a result with a
+    placeholder state.
     """
 
     task_id: str
@@ -305,19 +387,30 @@ class PathWaypoint(BaseModel):
     must_stop: bool = False
     allowed_deviation: float = 0.15  # m
     allowed_orientation_deviation: float = 0.1  # rad
+    #: Which controller is meant to drive this waypoint. Normally unset — the
+    #: whole path belongs to :attr:`PlannedPath.skill`. ``corridor_assist``
+    #: fills it in per waypoint so one plan can say "reactive from here to
+    #: there, planned either side of it", which is also what lets a viewer
+    #: colour the route before it is driven rather than after.
+    skill: str | None = None
 
 
 class PlannedPath(BaseModel):
     """Planner output: a dense, ordered waypoint list for the tracker.
 
-    Internal to the navigation node — planner and tracker are in one process
-    and no key carries this today. It is in the contract because it is the
-    interchange type between the two halves of a skill, and a project writing
-    its own planner or tracker needs to name it.
+    Published on :attr:`~robodog_sdk.topics.NavTopics.path` once per plan, and
+    again on a replan or a retreat. Visualisation only — nothing in the control
+    loop subscribes to it, and a consumer that misses one has missed a picture,
+    not a command.
     """
 
     task_id: str
     waypoints: list[PathWaypoint]
+    #: Which skill produced this path. A path is single-skill by construction;
+    #: ``corridor_assist`` republishes as it hands the wheel between planned
+    #: and reactive driving, so a subscriber sees the mode change as a new
+    #: path rather than having to infer it.
+    skill: str | None = None
 
 
 # ------------------------------------------------------------------ safety

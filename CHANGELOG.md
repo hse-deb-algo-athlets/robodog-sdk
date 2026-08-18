@@ -5,6 +5,129 @@ Semantic versioning; `0.x` minor versions may move keys.
 
 ## [Unreleased]
 
+### The contract now says what the stack actually does
+
+This package was written to a key scheme the stack was expected to adopt and
+did not. Nine keys were therefore addressing nothing at all — a subscriber saw
+silence, with no error, which is the worst way for a contract to be wrong. Every
+key is now checked against `robodog-digipro:src/interfaces/topics/topics.py`,
+and there is no drift left.
+
+| was (addressed nothing) | is |
+|---|---|
+| `state/{highstate,odometry,battery,motor}` | `system_state/*` |
+| `control/status` | `motion/gateway/status` |
+| `safety/estop` | `command/motion/estop` |
+| `safety/collision_zone` | `motion/collision/event` |
+| `input/gamepad`, `input/gamepad/status` | `nodes/joy`, `nodes/controller_status` — **absolute**, outside the namespace |
+
+The attribute names are unchanged (`StateTopics.odometry`, `SafetyTopics.estop`,
+`InputTopics.gamepad`), so code that went through the contract rather than
+through raw key strings only needs the version bump.
+
+**The namespace cannot be used for isolation yet.** The stack hard-codes the
+`robodog/` prefix into its own key strings, so a deployment must run with
+`namespace = "robodog"` exactly. `robodog/team-03` addresses nothing on the
+robot. Deriving the prefix is pending on the stack side; nothing here changes
+until it lands.
+
+**`latched=True` is intent, not a guarantee.** It rides on zenoh-ext advanced
+pub/sub, which needs the producer to participate, and the stack publishes with
+plain Zenoh publishers. Where late-join actually matters the stack answers a
+query instead — `safety/state`, `system_state/vda` and `system_state/system`
+are backed by queryables. The flags stay so the day the producers upgrade
+nothing has to move.
+
+### The safety path, which this package did not have
+
+The stack grew a safety aggregator: every panel publishes its own latch on
+`safety/source/{source_id}`, and the aggregator OR-combines them, runs the
+recovery phase machine, and publishes the one authority on `safety/state`.
+
+- `SafetyState` is a **level**, not an event — republished on a heartbeat as
+  well as on change, so a dropped packet costs one tick rather than the truth.
+  Every default is fail-safe: an unpopulated one reads as stopped with no live
+  source.
+- **Read `motion_permitted`, not `estop`.** They disagree for a whole phase.
+  `estop` drops at the start of `RELEASING` on purpose, because the bridge's
+  recovery — standing back up — is what triggers on the falling edge; holding
+  it engaged would mean the robot never gets up, never reports ready, and never
+  leaves `RELEASING`. Motion stays denied through that window by
+  `motion_permitted` instead.
+- `EstopPhase.SOURCE_LOST` is deliberately not a pressed button. It stops just
+  as hard, needs no release, and clears itself when frames resume — telling an
+  operator the emergency stop is pressed over a dropped heartbeat sends them
+  hunting a switch nobody touched.
+- `RobotClient.motion_permitted(within=...)` **fails safe on silence**: a latch
+  that stopped arriving reads exactly like one that says stopped. It takes a
+  freshness window rather than being a property, because the answer depends on
+  when the last frame arrived and not only on what it said.
+- **`RobotClient.emergency_stop()` changed key and payload.** It published
+  `EmergencyStopCommand` on `command/motion/estop`, which the safety node owns
+  and immediately overwrites from the composite — and which nav stopped reading.
+  It now publishes the `safety/cancel` button event that the safety node, the
+  nav coordinator and the fleet bridge each act on themselves: zero command,
+  task cancelled, order runtime wiped. It does not latch, and cannot: only the
+  physical switch latches.
+
+### Navigation follows the stack's task contract
+
+- **`TaskState.PENDING` is gone.** A submit starts the skill immediately, so a
+  task is always running or finished. A status query for a task the coordinator
+  does not remember is answered on the Zenoh **error channel** and now raises
+  `ServiceError` — `task_status()` used to document a `PENDING` reply that no
+  producer has ever sent. "Unknown" is not a lifecycle state.
+- **`task_status()` can answer `RUNNING`.** Unlike the result key it is not
+  necessarily terminal; check `state.is_terminal`.
+- **`TaskFeedback.state` is narrowed to `Literal[TaskState.RUNNING]`**, so a
+  feedback frame and the `TaskResult` cannot disagree — a stray terminal value
+  is rejected at validation rather than believed.
+- **`NavActivity` replaces a string convention.** The skill's sub-state used to
+  be smuggled as a colon suffix on `active_skill` (`"waypoint_follow:stalled
+  3.1s"`), which this package documented and told callers to parse. It is now a
+  typed field, with the prose in `note` beside it. `active_skill` is a plain
+  name again.
+- `TaskFeedback` gained `current_segment_index` / `total_segments` — which
+  waypoint of a route has been reached, reported as it is passed rather than at
+  the end of the leg.
+- **`EstopPolicy`, as `?on_estop=` on the submit.** The default, `CANCEL`,
+  discards the task on a stop; nothing here could previously ask for anything
+  else, so every task submitted through this package was silently discarded.
+  Pass `HOLD` only if the caller owns the mission and handles the recovery.
+- `NavigateThroughPosesGoal.corridor_deviation_m` — how far off the route a
+  human may hand the robot back before the task ends `BLOCKED` instead of
+  resuming.
+- `PathWaypoint.skill` and `PlannedPath.skill`, and **`PlannedPath` now has a
+  key**: `nav/path`, republished on every replan. This package said no key
+  carried it.
+- `corridor_assist` joins the documented skills — plans with A*, hands the
+  wheel to a reactive controller through the tight bits.
+
+### Added
+
+- `robodog_sdk.msgs.safety` — `SafetyState`, `EstopPhase`, `ButtonEvent`.
+- `robodog_sdk.msgs.system_state` — `SystemState` and its facets (`Posture`,
+  `ControlMode`, `OrderActivity`, `Headline`, `Location`, `VdaFacet`). The
+  facets are orthogonal on purpose: a robot can be `control=AUTO`, `order=IDLE`
+  and `posture=LYING` at the same moment, which a flat enum cannot say without
+  lying about one of them. `headline` and `ready_to_move` are derived for
+  consumers that have one line to spend.
+- `StateTopics.system`, `.vda` and `.releasebutton`; `SafetyTopics.state`,
+  `.source`, `.release` and `.cancel`; `NavTopics.path`.
+- `safety_source_key()` / `safety_source_topic()`, for one panel's own latch.
+- `StateView.safety` and `StateView.system`.
+- `FakeStack.set_safety()` and `.set_system()`, and `FakeStack.cancels` — the
+  record of what `emergency_stop()` asked for. `FakeNav.activity` makes a skill
+  appear to stall without an obstacle, and `FakeNav` now serves the status
+  query, including the raise for a task it never ran.
+
+### Fixed
+
+- **`StateView.localization` was never populated.** The field was documented
+  and typed, and nothing subscribed to `localization/pose`. Navigation goals are
+  expressed in that frame, so a caller reading `state.odometry` instead was
+  reasoning in the drifting one.
+
 ### Arbitration is the motion gateway, not an arbiter
 
 The lane-and-handshake design of ADR-010 was never built. What the stack built
@@ -29,7 +152,7 @@ async with robot.driving(x=0.3):                    # now
 | `Lane`, `ControlRequest`/`Grant`/`Release` | `MovementSource`, carried on every command |
 | `ControlServices.acquire` | nothing — there is no handshake |
 | `ControlTopics.release` | nothing — silence is the release |
-| `ArbiterStatus` on `control/status` | `MotionGatewayStatus` on the same key |
+| `ArbiterStatus` | `MotionGatewayStatus` on `ControlTopics.status` |
 | `RobotClient.control()` | `robot.preempted_by`, `robot.driving_now` — observation, not negotiation |
 | `robodog_sdk.msgs.control` | merged into `robodog_sdk.msgs.motion` |
 | `testing.FakeArbiter` | `stack.set_driver(...)` on `FakeStack` |
@@ -44,9 +167,9 @@ Consequences worth knowing before the bump:
   out-ranked the gamepad the moment source began to matter. The default is now
   the bottom rank, and `MovementSource.priority` / `.outranks()` make the order
   explicit — higher wins, which is the reverse of `Lane.priority`.
-- **`control/status` keeps its key and changes its payload.** It answers the
-  same question it always did — who is driving — with the answer the gateway
-  actually produces, including what the collision monitor did to the command
+- **`ControlTopics.status` keeps its name and changes its payload.** It answers
+  the same question it always did — who is driving — with the answer the
+  gateway actually produces, including what the collision monitor did to the command
   (`action`, `active_zones`) and whether the winner went silent
   (`watchdog_tripped`).
 - **`MotionTopics.move` is unchanged and still an output.** It is the gateway's
@@ -79,7 +202,7 @@ if result.state is TaskState.BLOCKED:
 | `NavTopics.status` (`NavigationStatus`, latched) | `NavTopics.feedback` + `NavTopics.result`, per task |
 | `NavigationState` | `TaskState` |
 | `NavigationSegment`, `Corridor` | goal fields on the two goal types |
-| `NavTopics.planned_path` | `PlannedPath` stays as a type; no key carries it |
+| `NavTopics.planned_path` | `NavTopics.path` (`nav/path`) |
 | `RobotClient.cancel_navigation()` | `RobotClient.cancel_task(task_id)` |
 
 Consequences worth knowing before the bump:
@@ -122,8 +245,9 @@ Consequences worth knowing before the bump:
   state, navigation.
 - `robodog_sdk.limits` — the robot's capability envelope, enforced as Pydantic
   field constraints on `MovementCommand` and `TiltBody`.
-- Trace roots on the topics that begin a causal chain: `state/odometry` and
-  `localization/pose`, both sampled at `TRACE_RATIO`. The movement keys are
+- Trace roots on the topics that begin a causal chain:
+  `system_state/odometry` and `localization/pose`, both sampled at
+  `TRACE_RATIO`. The movement keys are
   deliberately not roots, and a service call joins the caller's trace rather
   than starting one.
 - `RobotClient` — facade over the contract.
@@ -132,30 +256,24 @@ Consequences worth knowing before the bump:
 
 ### Changed from `src/interfaces` — wire-visible
 
-The key scheme was restructured in the stack first (ADR-010 step 1); this
-package mirrors it. The `robodog/` prefix had come to mean nothing — introduced
-for "data from the robot", it ended up on commands, navigation and diagnostics
-too — so it becomes the deployment namespace, and the first segment of a key
-now names the *kind* of thing it carries.
+The stack's keys are taken as they are. An earlier draft of this package
+restyled them — `system_state/*` to `state/*`, `nodes/joy` to `input/gamepad`,
+the safety path under one `safety/` prefix — on the expectation that the stack
+would follow; it did not, and those keys addressed nothing. See the realignment
+at the top of this entry. What remains below is the difference between the
+schemas here and the ones in `src/interfaces`, which is real.
 
-- **Keys are relative.** `[transport] namespace` is applied at runtime.
-- **`system_state/*` → `state/*`.**
-- **`nav/*` and `nodes/*` come under the namespace.** Outside it they cannot be
-  isolated per deployment: two simulations on one network would share them.
-- **`nodes/joy` → `input/gamepad`**, `nodes/controller_status` →
-  `input/gamepad/status`. `node/` is reserved for zenode's presence, health,
-  log and trace keys.
-- **`command/motion/estop` → `safety/estop`**, and the motion gateway's
-  `motion/collision/event` → `safety/collision_zone`, so the whole safety path
-  sits under one prefix. The payload is the stack's `CollisionZoneEvent`, which
-  names the zone that fired; it replaces this package's `ProtectiveFieldEvent`,
-  which had no zone and assumed there was only one.
-- **`sensors/realsense/*` → `sensors/d435i/*`**, and `sensors/go2_camera` →
-  `sensors/go2/camera`: device first, then stream, so a second camera does not
-  require renaming the first.
-- **`system_state/agv_state` → `vda5050/state`**, owned by the MQTT bridge.
-- **`nav/task/*` keys and `nav/costmap/*` come under the namespace**, like the
-  rest of `nav/*`.
+- **Keys are relative.** `[transport] namespace` is applied at runtime — but
+  the stack hard-codes `robodog/`, so today that namespace must be exactly
+  `robodog`.
+- **`nodes/joy` and `nodes/controller_status` are absolute.** They sit at the
+  root of the keyspace, outside the namespace, because that is where the
+  teleoperation node publishes them.
+- **`CollisionZoneEvent` replaces `ProtectiveFieldEvent`.** The stack's payload
+  names the zone that fired; this package's had no zone and assumed there was
+  only one.
+- **`system_state/agv_state` → `system_state/vda`**, carrying a typed
+  `VdaFacet` where the old key carried hand-rolled JSON.
 - **`nav/simple/*` is not in the contract.** The stack's `nav-remote` node
   offers a flattened JSON pub/sub facade for clients that cannot depend on the
   schemas. A client that has this package has the schemas, so it talks to the
@@ -167,8 +285,9 @@ now names the *kind* of thing it carries.
   deployed key buys nothing.
 - **Movement commands expire** (`max_age = 0.3 s`), replacing the bridge's
   `movement-max-delay-ms` and serving as the deadman.
-- **State topics are latched**, replacing three hand-rolled `session.get()`
-  startup pulls in the stack.
+- **State topics are declared latched**, in place of the hand-rolled
+  `session.get()` startup pulls in the stack. The stack's publishers do not
+  participate in it yet — see the note at the top of this entry.
 - **Velocities and tilt are bounded.** Values the old schemas accepted now
   raise `ValidationError`. See the warning in `limits.py`: the numbers are
   conservative placeholders until someone measures the robot.
@@ -186,8 +305,11 @@ now names the *kind* of thing it carries.
 
 - `camera.py` / `image.py` — JPEG frame envelopes, and the sensor topics that
   carry them (`RawCodec`, `shm=True`).
-- `controller.py` — gamepad state (`nodes/joy`, `nodes/controller_status`).
 - `livox.py` — CDR point-cloud decode; lands in `robodog_sdk.contrib` behind
   the `[livox]` extra rather than in the core.
-- Diagnostic topics (`robodog/diagnostic/*`) — pending the decision on whether
-  zenode's health heartbeat subsumes the diagnostic node.
+- Diagnostic topics (`robodog/diagnostic/*`) — deliberately not ported. The
+  diagnostic node re-publishes fields of highstate and battery one scalar per
+  key inside a `{name, category, data}` envelope; it is a view of
+  `StateTopics`, not a source.
+- Liveliness keys (`robodog/liveliness/*`) — liveliness tokens held by the Go2
+  bridge, not pub/sub topics.

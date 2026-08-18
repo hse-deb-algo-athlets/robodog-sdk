@@ -52,7 +52,7 @@ def cli() -> None:
 [transport]
 mode = "client"
 connect = ["tcp/localhost:7447"]
-namespace = "robodog"          # your team's sandbox, e.g. robodog/team-03
+namespace = "robodog"          # must be exactly this — see below
 ```
 
 Bring up the stack (simulation, no robot needed), then run your node:
@@ -128,8 +128,19 @@ gateway says who won (`active_source`), what it did to their command (`action`,
 silent (`watchdog_tripped`). It is the difference between debugging for an hour
 and reading one message.
 
-**Nothing may release an e-stop.** `robot.emergency_stop()` exists;
-there is no counterpart. Clearing a stop happens at the physical button.
+**Software can stop the robot; it cannot pretend to be the button.**
+`robot.emergency_stop()` publishes the cancel event that the safety node, the
+navigation coordinator and the fleet bridge each act on themselves — the robot
+is zeroed, the running task is cancelled, the order runtime is wiped. It does
+not *latch*, and there is no counterpart to it, because only the physical
+switch latches and only the release press on the panel clears one.
+
+**Ask `robot.motion_permitted()`, not `state.safety.value.estop`.** The latch
+drops one phase before the robot can actually move — deliberately, so the
+bridge can start standing it back up — and `motion_permitted` is the field that
+closes that gap. It also fails safe on silence: a safety latch that stopped
+arriving reads exactly like one that says stopped, which is why it takes a
+freshness window rather than being a property.
 
 **Navigation is a task, not a command.** `await robot.navigate_to(2.0, 0.5)`
 submits a goal, gets an id back, and returns the `TaskResult` that id ends on —
@@ -137,30 +148,50 @@ which can be `SUCCEEDED`, `BLOCKED`, `FAILED` or `CANCELED`. Only the first is
 arrival, and `BLOCKED` is not an error: the robot met the world and stopped.
 Check the result, do not assume it.
 
+**A task's lifecycle and what the skill is doing are different questions.**
+`TaskFeedback.state` is `RUNNING` for the whole leg and never anything else —
+the terminal verdict lives only on the result key, so the two can never
+disagree. What moves is `activity`: `cruising`, `aligning`, `stalled`,
+`retreating`. A stall is transient and the skill is still trying; only a
+`TaskResult` carrying `BLOCKED` means it gave up.
+
+**A task you are not watching is discarded on an e-stop.** That is the default,
+and it is the right one for a goal sent from a script: nobody wants a route
+resuming itself minutes after a human walked over and hit the button. Pass
+`on_estop=EstopPolicy.HOLD` only if this process owns the mission and is still
+there to handle the recovery.
+
+**Asking after a task the stack has forgotten raises.** `task_status()` answers
+with a real state for a task the coordinator remembers — including `RUNNING`
+for one still under way, so check `state.is_terminal` — and raises
+`ServiceError` for one it has never heard of or has since evicted. "Unknown" is
+not a lifecycle state and the contract will not invent one.
+
 **One task at a time.** There is no queue. A goal submitted while the robot is
 navigating is *refused* unless you pass `preempt=True`, which cancels the
 running task first. Refusal raises `PermissionError` from `navigate_to`; if you
 would rather branch than catch, use `robot.submit()` and read `handle.accepted`.
 
 **The namespace must match the deployment.** Keys in the contract are relative;
-`[transport] namespace` is prefixed at runtime, so `state/odometry` becomes
-`robodog/state/odometry`. Everything talking to one robot uses that robot's
-namespace — set it to anything else and you will see no data at all, with no
-error. It is the first thing to check when nothing arrives, and
+`[transport] namespace` is prefixed at runtime, so `system_state/odometry`
+becomes `robodog/system_state/odometry`. Everything talking to one robot uses
+that robot's namespace — set it to anything else and you will see no data at
+all, with no error. It is the first thing to check when nothing arrives, and
 `uv run zenode nodes` shows whether you are looking in the right place.
 
-A namespace separates *deployments*, not users. Your own simulation can run
-under `robodog/team-03` in complete isolation; against the shared robot you use
-its namespace like everyone else, and the gateway — not the namespace — decides
-who drives.
+Today that means **`namespace = "robodog"`, and nothing else**: the stack still
+hard-codes the prefix into its own key strings rather than deriving it from a
+namespace, so an isolated sandbox under `robodog/team-03` would talk to itself
+and to nothing on the robot. Deriving it is a change pending on the stack side.
 
 ## Tracing
 
 Your node is traced whether or not you ask for it, and that is the point: when
 a command goes out and nothing moves, the question spans four processes.
 
-A trace starts at the topics that begin a causal chain — `state/odometry` and
-`localization/pose`, both sampled at 1 % — and follows the data from there.
+A trace starts at the topics that begin a causal chain —
+`system_state/odometry` and `localization/pose`, both sampled at 1 % — and
+follows the data from there.
 **Everything your handler causes stays in that trace automatically**: `put()`,
 `await self.call()`, `self.spawn()` and `await self.blocking()`. There is
 nothing to configure and no API to learn.
@@ -240,9 +271,14 @@ only takes effect on whichever topic actually started it.
 latched state and a record of everything your node tried to drive, and `FakeNav`
 for navigation — it accepts goals, streams feedback, and ends a task wherever you
 tell it to, so the `BLOCKED` branch of your code gets exercised without needing
-an obstacle. `stack.set_driver(...)` fakes a human grabbing the gamepad or a
-collision zone firing, which is otherwise hard to arrange on a desk. With
-`zenode.testing`, the whole thing runs in-process — no router, no network.
+an obstacle. `nav.activity = NavActivity.STALLED` makes the skill appear to
+stall mid-task without one either.
+
+`stack.set_driver(...)` fakes a human grabbing the gamepad or a collision zone
+firing, and `stack.set_safety(...)` fakes the e-stop — a pressed button, or the
+safety source going quiet, which stops just as hard for an entirely different
+reason. All of it is otherwise hard to arrange on a desk. With `zenode.testing`,
+the whole thing runs in-process — no router, no network.
 
 ```python
 async with harness() as h:

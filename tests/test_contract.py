@@ -7,15 +7,19 @@ declared and every topic added later without being modified.
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 from zenode import registered_services, registered_topics
 
 import robodog_sdk  # noqa: F401  — importing registers the TopicSets
 from robodog_sdk import (
+    EstopPhase,
     MovementCommand,
     MovementSource,
     NavigateThroughPosesGoal,
     NavigateToPoseGoal,
     Pose2D,
+    SafetyState,
+    TaskFeedback,
     TaskGoalEnvelope,
     TaskState,
 )
@@ -25,6 +29,7 @@ from robodog_sdk.topics import (
     NavServices,
     NavTopics,
     SafetyTopics,
+    safety_source_key,
     task_feedback_key,
     task_result_key,
     task_status_service,
@@ -110,9 +115,31 @@ def test_gateway_status_is_latched() -> None:
     assert ControlTopics.status.latched
 
 
-def test_estop_is_latched() -> None:
+def test_the_safety_latch_is_latched() -> None:
     """A node joining during a stop learns of it without waiting for an edge."""
-    assert SafetyTopics.estop.latched
+    assert SafetyTopics.state.latched
+    assert SafetyTopics.estop.latched, "the legacy mirror carries the same duty"
+
+
+def test_safety_defaults_deny_motion() -> None:
+    """An unpopulated latch must read as stopped. Every default here is a
+    decision about what happens when a field is forgotten."""
+    fresh = SafetyState()
+    assert fresh.estop and not fresh.source_alive
+    assert not fresh.motion_permitted
+
+
+def test_motion_is_denied_while_the_robot_is_standing_back_up() -> None:
+    """``estop`` drops early so the bridge can start the recovery; motion has
+    to stay denied until it finishes, or the gate is meaningless."""
+    releasing = SafetyState(estop=False, source_alive=True, phase=EstopPhase.RELEASING)
+    assert not releasing.estop
+    assert not releasing.motion_permitted
+
+
+def test_a_safety_source_key_matches_the_wildcard_the_aggregator_watches() -> None:
+    prefix, _, suffix = SafetyTopics.source.key.partition("*")
+    assert safety_source_key("panel-1") == f"{prefix}panel-1{suffix}"
 
 
 def test_task_keys_agree_with_the_wildcards_they_are_observed_through() -> None:
@@ -136,6 +163,32 @@ def test_task_result_is_not_latched() -> None:
 def test_global_costmap_is_latched() -> None:
     """The map is published once at startup; a late joiner still needs it."""
     assert NavTopics.costmap_global.latched
+
+
+def test_there_is_no_state_for_a_task_nobody_remembers() -> None:
+    """An unknown task is answered on the error channel. A placeholder state
+    would be indistinguishable from a real one, which is the whole problem."""
+    assert not hasattr(TaskState, "PENDING")
+    assert set(TaskState) == {
+        TaskState.RUNNING,
+        TaskState.SUCCEEDED,
+        TaskState.FAILED,
+        TaskState.CANCELED,
+        TaskState.BLOCKED,
+    }
+
+
+def test_feedback_cannot_carry_a_terminal_state() -> None:
+    """Feedback streams only while the task is alive, so narrowing the field
+    is what makes it impossible for a frame and the result to disagree.
+
+    The narrowing is enforced twice, which is the point: pyright rejects the
+    line below at author time — hence the ignore, which *is* half the assertion
+    — and Pydantic rejects the same value arriving off the wire.
+    """
+    assert TaskFeedback(task_id="t").state is TaskState.RUNNING
+    with pytest.raises(ValidationError):
+        TaskFeedback(task_id="t", state=TaskState.SUCCEEDED)  # type: ignore[arg-type]
 
 
 def test_terminal_states_are_exactly_the_four_endings() -> None:

@@ -88,22 +88,37 @@ class Navigate(Node):
         # waypoint_follow drives the route it is given. A planning skill is
         # free to treat the intermediate poses as advisory and cut the corner,
         # which is not what a route is for.
+        #
+        # The corridor is the other half of meaning it: if a human takes the
+        # gamepad mid-leg and lets go more than half a metre off this line,
+        # the task ends BLOCKED rather than resuming from wherever it now is.
         return NavigateThroughPosesGoal(
             poses=[Pose2D(x=2.0, y=1.5, theta=0.0), Pose2D(x=0.0, y=1.5, theta=0.0)],
             skill="waypoint_follow",
+            corridor_deviation_m=0.5,
         )
 
     async def _watch(self) -> None:
         """Log progress while a task runs. Feedback is not latched, so a gap
-        here means the skill stopped publishing, not that it finished."""
+        here means the skill stopped publishing, not that it finished.
+
+        ``state`` is RUNNING for the whole leg and says nothing useful here;
+        ``activity`` is the field that moves. A stall is not a failure — the
+        skill is still trying — so this reports it and keeps waiting.
+        """
         while True:
             feedback = self.robot.state.nav.value
             if feedback is not None and self.robot.navigating:
+                where = ""
+                if feedback.current_segment_index is not None:
+                    where = f" [{feedback.current_segment_index + 1}/{feedback.total_segments}]"
                 self.log.info(
-                    "%s: %.2f m to go (%s)",
+                    "%s: %.2f m to go — %s%s%s",
                     feedback.task_id[:8],
                     feedback.distance_to_goal or float("nan"),
-                    feedback.active_skill or "?",
+                    feedback.activity.value,
+                    f" ({feedback.note})" if feedback.note else "",
+                    where,
                 )
             await asyncio.sleep(1.0)
 
