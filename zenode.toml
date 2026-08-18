@@ -10,5 +10,5 @@
 
 [transport]
 mode = "client"
-connect = ["tcp/192.168.4.150:7447"]
+connect = ["tcp/127.0.0.1:7447"]
 namespace = "robodog"
