@@ -5,7 +5,7 @@ description = "Wire contract and client for the Robodog Zenoh control system"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Fabian Bahr", email = "61473429+fabian-bxr@users.noreply.github.com" }]
 keywords = ["zenoh", "robotics", "unitree", "go2", "quadruped", "zenode"]
 classifiers = [
@@ -38,6 +38,7 @@ livox = ["rosbags>=0.11.3", "numpy>=2.0"]
 
 [project.urls]
 Homepage = "https://github.com/hse-deb-algo-athlets/robodog-sdk"
+Documentation = "https://hse-deb-algo-athlets.github.io/robodog-sdk/"
 Repository = "https://github.com/hse-deb-algo-athlets/robodog-sdk"
 Issues = "https://github.com/hse-deb-algo-athlets/robodog-sdk/issues"
 
@@ -60,6 +61,15 @@ dev = [
     "pyright>=1.1.410",
     "ruff>=0.12",
     "pre-commit>=4.6.1",
+]
+docs = [
+    # Built in CI and on demand (uv run --group docs …); never shipped, so the
+    # runtime-dependency constraint is untouched. Mirrors the zenode setup.
+    "sphinx>=8.2",
+    "furo>=2024.8.6",
+    "myst-parser>=4.0",
+    "sphinx-copybutton>=0.5.2",
+    "sphinxcontrib-mermaid>=1.0",
 ]
 
 [tool.pytest.ini_options]

@@ -323,3 +323,8 @@ uv run pytest
 uv run ruff check --fix && uv run ruff format
 uv run pyright
 ```
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE)
+Copyright 2026 Hochschule Esslingen.

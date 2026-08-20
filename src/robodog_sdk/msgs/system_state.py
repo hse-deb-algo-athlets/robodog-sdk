@@ -57,7 +57,7 @@ class Posture(StrEnum):
         return GO2_MODE_TO_POSTURE.get(mode, cls.UNKNOWN)
 
 
-#: Go2 ``SportModeState.mode`` → :class:`Posture`, from the Unitree enum.
+#: Go2 ``SportModeState.mode`` → :class:`Posture`, from the Unitree enum::
 #:
 #:   mode  name             posture      mode  name             posture
 #:   ────  ───────────────  ──────────   ────  ───────────────  ──────────
