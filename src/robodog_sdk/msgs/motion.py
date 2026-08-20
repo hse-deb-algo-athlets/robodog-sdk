@@ -26,19 +26,49 @@ def _utcnow() -> datetime:
 
 
 class MovementSource(StrEnum):
-    """Origin of a movement command.
+    """Who is asking the robot to move — and, because of that, how loudly.
 
-    Provenance only. Priority is determined by the lane a command is published
-    to (see :class:`~robodog_sdk.topics.MotionTopics`), never by this field.
+    This field *is* the arbitration. Every source publishes to one inlet
+    (:attr:`~robodog_sdk.topics.MotionTopics.request`) and the motion gateway
+    forwards whichever fresh command has the highest-ranking source, so
+    claiming a source you are not is how you take the wheel from someone who
+    is.
+
+    Declaration order defines the ranking; :attr:`priority` is derived from it.
+
+    - ``autonomous`` — anything acting on its own behalf. The default, and the
+      right one for a node you are writing.
+    - ``planner`` — a navigation skill following a path.
+    - ``assisted_teleop`` — human intent shaped by a skill rather than sent raw.
+    - ``controller`` — a human on the gamepad, who outranks everything.
     """
 
-    controller = "controller"
     autonomous = "autonomous"
     planner = "planner"
+    assisted_teleop = "assisted_teleop"
+    controller = "controller"
+
+    @property
+    def priority(self) -> int:
+        """Rank of this source. **Higher wins**, unlike an index.
+
+        The inversion is worth reading twice: ``autonomous`` is 0 and loses to
+        everything, ``controller`` is 3 and loses to nothing.
+        """
+        return list(MovementSource).index(self)
+
+    def outranks(self, other: MovementSource) -> bool:
+        """Whether a fresh command from this source displaces one from ``other``."""
+        return self.priority > other.priority
 
 
 class MovementCommand(BaseModel):
     """Velocity command in the body frame.
+
+    ``source`` defaults to :attr:`MovementSource.autonomous`, the lowest rank.
+    A command claims the wheel by naming a higher source, so the default is the
+    one that cannot take the robot away from a human by accident. Say
+    ``source=MovementSource.controller`` only if you *are* the gamepad.
 
     Attributes:
         x: Forward velocity, m/s.
@@ -50,7 +80,7 @@ class MovementCommand(BaseModel):
     x: float = Field(default=0.0, ge=-MAX_LINEAR_MS, le=MAX_LINEAR_MS)
     y: float = Field(default=0.0, ge=-MAX_LATERAL_MS, le=MAX_LATERAL_MS)
     z_deg: float = Field(default=0.0, ge=-MAX_YAW_RATE_DEG, le=MAX_YAW_RATE_DEG)
-    source: MovementSource = MovementSource.controller
+    source: MovementSource = MovementSource.autonomous
     timestamp: datetime = Field(default_factory=_utcnow)
 
     def is_zero(self) -> bool:
@@ -120,3 +150,57 @@ class EmergencyStopCommand(BaseModel):
 
     command: EmergencyStop
     timestamp: datetime = Field(default_factory=_utcnow)
+
+
+class GatewayAction(StrEnum):
+    """What the gateway did to the command it forwarded.
+
+    ``pass_through`` — nothing in the way; the command went out unchanged.
+    ``limit`` — a limit zone capped one or more velocity components.
+    ``slowdown`` — a slowdown zone scaled the whole command by a factor < 1.
+    ``stop`` — a stop zone, a stale LiDAR scan, or the watchdog intervened.
+
+    ``stop`` does not always mean zero. A breached stop zone is *directional*:
+    the gateway strips only the velocity heading into the obstacle, leaving
+    motion away from it and rotation intact, so the robot can still reverse or
+    turn out of the zone rather than being trapped in it. Only an obstacle that
+    surrounds the robot, or a stale scan or tripped watchdog, collapses the
+    command entirely. Read ``active_zones`` for which zones are breached, not
+    this, if the question is what the robot may still do.
+    """
+
+    pass_through = "pass_through"
+    limit = "limit"
+    slowdown = "slowdown"
+    stop = "stop"
+
+
+class MotionGatewayStatus(BaseModel):
+    """Who is driving, and what the gateway is doing about it.
+
+    Published on every state change rather than every tick, so it is an edge
+    stream: latched, and unchanged between edges. This is the key to read when
+    a command is being sent and the robot is not moving — it names the reason.
+
+    Attributes:
+        active_source: Source whose command is being forwarded. ``None`` means
+            nobody has sent a fresh command, which is idle rather than stopped.
+        action: What the collision monitor did to that command.
+        active_zones: Names of the zones currently breached, if any.
+        watchdog_tripped: The active source went silent and the gateway is
+            holding the robot at zero until it speaks again.
+        reason: Free text for the last transition, e.g. which source preempted
+            which. Diagnostic — do not branch on it.
+    """
+
+    active_source: MovementSource | None = None
+    action: GatewayAction = GatewayAction.pass_through
+    active_zones: list[str] = Field(default_factory=list)
+    watchdog_tripped: bool = False
+    reason: str | None = None
+    timestamp: datetime = Field(default_factory=_utcnow)
+
+    @property
+    def moving_allowed(self) -> bool:
+        """Whether a command sent right now would reach the robot intact."""
+        return not self.watchdog_tripped and self.action is not GatewayAction.stop

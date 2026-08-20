@@ -52,7 +52,7 @@ def cli() -> None:
 [transport]
 mode = "client"
 connect = ["tcp/localhost:7447"]
-namespace = "robodog"          # your team's sandbox, e.g. robodog/team-03
+namespace = "robodog"          # must be exactly this — see below
 ```
 
 Bring up the stack (simulation, no robot needed), then run your node:
@@ -70,7 +70,7 @@ key to its payload type, and `robodog_sdk.msgs` holds the schemas.
 from zenode import publish
 from robodog_sdk import MotionTopics, MovementCommand
 
-cmd = publish(MotionTopics.move_agent)
+cmd = publish(MotionTopics.request)
 cmd.put(MovementCommand(x=0.3))
 ```
 
@@ -78,7 +78,7 @@ cmd.put(MovementCommand(x=0.3))
 privileged access. It exists so a first node is short:
 
 ```python
-async with robot.control(), robot.driving(x=0.3):
+async with robot.driving(x=0.3):
     await asyncio.sleep(2)  # stops on the way out, always
 ```
 
@@ -89,6 +89,8 @@ supported path.
 [`contract_drive.py`](examples/contract_drive.py) and
 [`client_drive.py`](examples/client_drive.py). Diff them to see exactly what the
 client does and does not do for you.
+[`navigate.py`](examples/navigate.py) covers the task contract: submit, watch,
+and handle each of the four ways a task can end.
 
 See the whole contract without reading the source:
 
@@ -98,45 +100,119 @@ uv run zenode topics --contract robodog_sdk.topics
 
 ## Things that will bite you once
 
-**Commands expire.** Every movement lane carries `max_age = 0.3 s`, which is
-the deadman: stop publishing and the robot stops. One `robot.move(...)` drives
-for 300 ms, not until you say otherwise. Use `robot.driving(...)`, or publish
-at 10 Hz yourself.
+**Commands expire.** Movement keys carry `max_age = 0.3 s`, which is the
+deadman: stop publishing and the robot stops. One `robot.move(...)` drives for
+300 ms, not until you say otherwise. Use `robot.driving(...)`, or publish at
+10 Hz yourself.
 
 **Velocities are bounded.** `MovementCommand` enforces the robot's capability
 envelope (`robodog_sdk.limits`), so an out-of-range value raises
 `ValidationError` in *your* process rather than surprising anyone in the lab.
 If a limit is wrong, fix it in `limits.py` — not by working around the model.
 
-**You are not the only driver.** Commands go on the `agent` lane, which the
-arbiter ranks below teleoperation and the e-stop. Take the lane explicitly with
-`async with robot.control():` so it is visible who is driving.
+**You are not the only driver, and you do not ask to be.** Every source
+publishes to one inlet and the motion gateway forwards whichever *fresh*
+command carries the highest-ranking `MovementSource` —
+`controller` > `assisted_teleop` > `planner` > `autonomous`. There is no lock to
+take and none to release: priority rides on every frame, so a human touching the
+gamepad wins instantly, and you resume by yourself when they stop. Read
+`robot.preempted_by` if you want to know; ignoring it is also correct.
 
-**Nothing may release an e-stop.** `robot.emergency_stop()` exists;
-there is no counterpart. Clearing a stop happens at the physical button.
+The corollary is that **`source` is not a label, it is the claim**. It defaults
+to `autonomous`, the bottom rank. Setting it higher takes the robot away from
+whoever that rank belongs to, so only set it if you are that thing.
+
+**When commands go out and nothing moves, read `robot.state.gateway`.** The
+gateway says who won (`active_source`), what it did to their command (`action`,
+`active_zones`), and whether the winner went silent (`watchdog_tripped`). It is
+the difference between debugging for an hour and reading one message. It is
+published on every change and re-asserted about once a second, so a value going
+stale means the gateway itself is gone.
+
+`GatewayAction.stop` does not mean zero. A breached stop zone is *directional*:
+only the velocity heading into the obstacle is stripped, so the robot can still
+reverse or turn out of the zone. Only an obstacle that surrounds it, a stale
+LiDAR scan or a tripped watchdog collapses the command entirely.
+
+**Software can stop the robot; it cannot pretend to be the button.**
+`robot.emergency_stop()` publishes the cancel event that the safety node, the
+navigation coordinator and the fleet bridge each act on themselves — the robot
+is zeroed, the running task is cancelled, the order runtime is wiped. It does
+not *latch*, and there is no counterpart to it, because only the physical
+switch latches and only the release press on the panel clears one.
+
+**Ask `robot.motion_permitted()`, not `state.safety.value.estop`.** The latch
+drops one phase before the robot can actually move — deliberately, so the
+bridge can start standing it back up — and `motion_permitted` is the field that
+closes that gap. It also fails safe on silence: a safety latch that stopped
+arriving reads exactly like one that says stopped, which is why it takes a
+freshness window rather than being a property.
+
+**Navigation is a task, not a command.** `await robot.navigate_to(2.0, 0.5)`
+submits a goal, gets an id back, and returns the `TaskResult` that id ends on —
+which can be `SUCCEEDED`, `BLOCKED`, `FAILED` or `CANCELED`. Only the first is
+arrival, and `BLOCKED` is not an error: the robot met the world and stopped.
+Check the result, do not assume it.
+
+**A map-frame coordinate is only valid while the map is.** If you store a
+pose and drive to it later, store `robot.map_id()` beside it and refuse the
+coordinate when the ids differ — nothing in a bare pose says which map it came
+from, so a rebuilt or re-sessioned map turns every saved coordinate into a
+confident drive to the wrong place. `map_id()` returns `None` for "no usable
+map" (SLAM down, odometry fallback, or nothing published), which never means
+"unchanged".
+
+**A task's lifecycle and what the skill is doing are different questions.**
+`TaskFeedback.state` is `RUNNING` for the whole task and never anything else —
+the terminal verdict lives only on the result key, so the two can never
+disagree. What moves is `activity`: `cruising`, `aligning`, `stalled`,
+`retreating`. A stall is transient and the skill is still trying; only a
+`TaskResult` carrying `BLOCKED` means it gave up.
+
+**A task you are not watching is discarded on an e-stop.** That is the default,
+and it is the right one for a goal sent from a script: nobody wants a route
+resuming itself minutes after a human walked over and hit the button. Pass
+`on_estop=EstopPolicy.HOLD` only if this process owns the mission and is still
+there to handle the recovery.
+
+**Asking after a task the stack has forgotten raises.** `task_status()` answers
+with a real state for a task the coordinator remembers — including `RUNNING`
+for one still under way, so check `state.is_terminal` — and raises
+`ServiceError` for one it has never heard of or has since evicted. "Unknown" is
+not a lifecycle state and the contract will not invent one.
+
+**One task at a time.** There is no queue. A goal submitted while the robot is
+navigating is *refused* unless you pass `preempt=True`, which cancels the
+running task first. Refusal raises `PermissionError` from `navigate_to`; if you
+would rather branch than catch, use `robot.submit()` and read `handle.accepted`.
 
 **The namespace must match the deployment.** Keys in the contract are relative;
-`[transport] namespace` is prefixed at runtime, so `state/odometry` becomes
-`robodog/state/odometry`. Everything talking to one robot uses that robot's
-namespace — set it to anything else and you will see no data at all, with no
-error. It is the first thing to check when nothing arrives, and
+`[transport] namespace` is prefixed at runtime, so `system_state/odometry`
+becomes `robodog/system_state/odometry`. Everything talking to one robot uses
+that robot's namespace — set it to anything else and you will see no data at
+all, with no error. It is the first thing to check when nothing arrives, and
 `uv run zenode nodes` shows whether you are looking in the right place.
 
-A namespace separates *deployments*, not users. Your own simulation can run
-under `robodog/team-03` in complete isolation; against the shared robot you use
-its namespace like everyone else, and the arbiter — not the namespace — decides
-who drives.
+Today that means **`namespace = "robodog"`, and nothing else**: the stack still
+hard-codes the prefix into its own key strings rather than deriving it from a
+namespace, so an isolated sandbox under `robodog/team-03` would talk to itself
+and to nothing on the robot. Deriving it is a change pending on the stack side.
 
 ## Tracing
 
 Your node is traced whether or not you ask for it, and that is the point: when
 a command goes out and nothing moves, the question spans four processes.
 
-A trace starts at the topics that begin a causal chain — `state/odometry`,
-`localization/pose` (both sampled at 1 %) and `nav/request` (every one) — and
-follows the data from there. **Everything your handler causes stays in that
-trace automatically**: `put()`, `await self.call()`, `self.spawn()` and
-`await self.blocking()`. There is nothing to configure and no API to learn.
+A trace starts at the topics that begin a causal chain —
+`system_state/odometry` and `localization/pose`, both sampled at 1 % — and
+follows the data from there.
+**Everything your handler causes stays in that trace automatically**: `put()`,
+`await self.call()`, `self.spawn()` and `await self.blocking()`. There is
+nothing to configure and no API to learn.
+
+A service call is not a trace root: it joins the caller's trace, or none. So a
+navigation task submitted from a script has no trace of its own, while one
+submitted from inside a handler belongs to the trace of whatever triggered it.
 
 Follow one message across the fleet:
 
@@ -205,10 +281,18 @@ only takes effect on whichever topic actually started it.
 
 ## Testing without a robot
 
-`robodog_sdk.testing.FakeStack` plays the other side of the conversation:
-latched state, an arbiter that grants lanes, and a record of everything your
-node tried to drive. With `zenode.testing`, the whole thing runs in-process —
-no router, no network.
+`robodog_sdk.testing` plays the other side of the conversation: `FakeStack` for
+latched state and a record of everything your node tried to drive, and `FakeNav`
+for navigation — it accepts goals, streams feedback, and ends a task wherever you
+tell it to, so the `BLOCKED` branch of your code gets exercised without needing
+an obstacle. `nav.activity = NavActivity.STALLED` makes the skill appear to
+stall mid-task without one either.
+
+`stack.set_driver(...)` fakes a human grabbing the gamepad or a collision zone
+firing, and `stack.set_safety(...)` fakes the e-stop — a pressed button, or the
+safety source going quiet, which stops just as hard for an entirely different
+reason. All of it is otherwise hard to arrange on a desk. With `zenode.testing`,
+the whole thing runs in-process — no router, no network.
 
 ```python
 async with harness() as h:

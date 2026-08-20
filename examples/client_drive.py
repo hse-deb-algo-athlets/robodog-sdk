@@ -1,22 +1,17 @@
-"""Drive forward a fixed distance, using RobotClient.
+"""Drive forward a fixed distance, using ``RobotClient``.
 
     uv run python examples/client_drive.py
 
-Equivalent to ``contract_drive.py``. The client supplies:
+Equivalent to ``contract_drive.py``. The client supplies ``driving()``
+(republishes at 10 Hz, stops on exit), ``state`` (latched pose and its age)
+and ``preempted_by`` (who outranks us at the gateway).
 
-- ``driving()``, which republishes at 10 Hz and sends zero velocity on exit,
-  removing the timer and the ``on_stop`` handler.
-- ``control()``, which acquires and releases the agent lane.
-- ``state``, which carries the latched pose and its age, removing the
-  subscription and the first-message bookkeeping.
+Distance is measured against ``state.odometry`` rather than
+``state.localization``: the fused pose jumps when SLAM corrects, which reads
+here as having driven backwards.
 
-Requires the arbiter node, which grants the command lane. ``contract_drive.py``
-does not, so use that one against a stack where the arbiter is not deployed
-yet.
-
-The behaviour runs as a background task rather than inline in ``on_start``:
-decorated bindings are wired after ``on_start`` returns, so blocking there
-would leave the handlers inactive.
+The drive runs as a background task because decorated bindings are wired only
+after ``on_start`` returns.
 """
 
 from __future__ import annotations
@@ -26,7 +21,7 @@ import math
 
 from zenode import Node, NodeConfig, run, subscribe
 
-from robodog_sdk import ProtectiveFieldEvent, RobotClient, SafetyTopics
+from robodog_sdk import CollisionZoneEvent, RobotClient, SafetyTopics
 
 
 class DriveConfig(NodeConfig):
@@ -49,24 +44,22 @@ class ClientDrive(Node):
         self._blocked = False
         self.spawn(self._run_drive(), name="drive")
 
-    @subscribe(SafetyTopics.protective_field)
-    async def on_protective_field(self, msg: ProtectiveFieldEvent) -> None:
+    @subscribe(SafetyTopics.collision_zone)
+    async def on_collision_zone(self, msg: CollisionZoneEvent) -> None:
         self._blocked = msg.active
 
     async def _run_drive(self) -> None:
-        # control() calls the arbiter's acquire service. Waiting for its
-        # presence first turns "no arbiter deployed" into a named error rather
-        # than an opaque service timeout — the arbiter is step 3 of the ADR-010
-        # rollout, so on a stack without it this is where you stop.
-        await self.robot.wait_until_ready("arbiter", timeout=5.0)
         origin = await self._first_pose()
         self.log.info("drive started at %.2f, %.2f", origin[0], origin[1])
 
-        async with (
-            self.robot.control(reason="example drive"),
-            self.robot.driving(x=self.config.speed),
-        ):
+        async with self.robot.driving(x=self.config.speed):
             while not self._blocked and self._travelled_from(origin) < self.config.distance:
+                if (driver := self.robot.preempted_by) is not None:
+                    # The gateway re-decides every frame, so continuing to
+                    # publish would resume the drive once they let go. Giving
+                    # up is this example's choice, not the contract's.
+                    self.log.info("yielding to %s", driver.value)
+                    break
                 await asyncio.sleep(0.1)
 
         self.log.info(
@@ -85,8 +78,8 @@ class ClientDrive(Node):
     def _travelled_from(self, origin: tuple[float, float]) -> float:
         pose = self.robot.state.odometry.value
         if pose is None or self.robot.state.odometry.age > 1.0:
-            # Stale pose: report no progress rather than an unfounded figure.
-            # The drive continues; the distance simply stops advancing.
+            # Stale pose: report no progress rather than a figure we cannot
+            # support. The drive continues; the distance stops advancing.
             return 0.0
         return math.hypot(pose.x - origin[0], pose.y - origin[1])
 

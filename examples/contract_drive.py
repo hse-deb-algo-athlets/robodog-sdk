@@ -3,19 +3,15 @@
     uv run python examples/contract_drive.py
 
 Equivalent to ``client_drive.py``, written against ``Topic`` declarations
-rather than :class:`~robodog_sdk.RobotClient`. Compare the two to see what the
-client provides.
-
-Handled explicitly here:
+rather than :class:`~robodog_sdk.RobotClient`. Handled explicitly here:
 
 - Republishing. A command expires after ``COMMAND_MAX_AGE``, so sustained
-  motion requires a timer rather than a single ``put()``.
-- Stopping on shutdown. ``on_stop`` publishes zero velocity; without it the
-  robot continues until the deadman elapses.
-- The lane handshake is omitted, so this node runs at the arbiter's lowest
-  priority. ``client_drive.py`` shows the acquire and release.
-- Trace continuity across the timer. ``state/odometry`` is a trace root, but a
-  timer body runs outside any trace, so the pose's context is captured in the
+  motion needs a timer rather than a single ``put()``.
+- Stopping on shutdown, in ``on_stop``; without it the robot runs until the
+  deadman elapses.
+- The command's rank, carried on every frame as ``source=autonomous``.
+- Trace continuity. ``system_state/odometry`` is a trace root, but a timer
+  body runs outside any trace, so the pose's context is captured in the
   handler and restored before publishing.
 """
 
@@ -26,11 +22,11 @@ import math
 from zenode import Node, NodeConfig, every, publish, run, subscribe, trace
 
 from robodog_sdk import (
+    CollisionZoneEvent,
     MotionTopics,
     MovementCommand,
     MovementSource,
     OdometryState,
-    ProtectiveFieldEvent,
     SafetyTopics,
     StateTopics,
 )
@@ -48,11 +44,13 @@ class ContractDrive(Node):
     name = "contract-drive"
     config: DriveConfig
 
-    #: Materialized before ``on_start`` and usable from it.
-    cmd = publish(MotionTopics.move)
+    #: Materialized before ``on_start`` and usable from it. The gateway inlet,
+    #: not ``move``: that key is the gateway's output, and publishing there
+    #: bypasses both arbitration and the collision zones.
+    cmd = publish(MotionTopics.request)
 
     # Declared here, assigned in on_start: plain state needs no session, but
-    # declaring it keeps the node's attributes discoverable in one place.
+    # declaring it keeps the node's attributes in one place.
     _origin: tuple[float, float] | None
     _travelled: float
     _blocked: bool
@@ -74,23 +72,25 @@ class ContractDrive(Node):
         self._travelled = math.hypot(msg.x - self._origin[0], msg.y - self._origin[1])
         self._pose_trace = trace.current()
 
-    @subscribe(SafetyTopics.protective_field)
-    async def on_protective_field(self, msg: ProtectiveFieldEvent) -> None:
-        """Handle a protective-field transition: one message per edge."""
+    @subscribe(SafetyTopics.collision_zone)
+    async def on_collision_zone(self, msg: CollisionZoneEvent) -> None:
+        """Handle a collision-zone transition: one message per edge."""
         self._blocked = msg.active
-        self.log.warning("protective field %s", "breached" if msg.active else "clear")
+        self.log.warning("collision zone %s", "breached" if msg.active else "clear")
 
     @every("rate_hz", unit="hz")
     async def tick(self) -> None:
         if self._origin is None:
             return  # no pose yet — publishing would be driving blind
-        # A timer is caused by the clock, not by a message, so it runs outside
-        # any trace. Restoring the pose's context keeps the command linked to
-        # the measurement it was derived from.
+        # A timer is caused by the clock, not a message, so it runs outside any
+        # trace. Restoring the pose's context keeps the command linked to the
+        # measurement it came from.
         with trace.using(self._pose_trace):
             if self._blocked or self._travelled >= self.config.distance:
                 self.cmd.put(MovementCommand(source=MovementSource.autonomous))
-                return
+                self.log.info("drive stopped after %.2f m", self._travelled)
+                self.stop()
+                return  # without this the zero command is undone on the next line
             self.cmd.put(MovementCommand(x=self.config.speed, source=MovementSource.autonomous))
 
     async def on_stop(self) -> None:
