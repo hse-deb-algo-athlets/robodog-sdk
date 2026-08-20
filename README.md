@@ -124,9 +124,15 @@ whoever that rank belongs to, so only set it if you are that thing.
 
 **When commands go out and nothing moves, read `robot.state.gateway`.** The
 gateway says who won (`active_source`), what it did to their command (`action`,
-`active_zones` — a collision zone can zero you), and whether the winner went
-silent (`watchdog_tripped`). It is the difference between debugging for an hour
-and reading one message.
+`active_zones`), and whether the winner went silent (`watchdog_tripped`). It is
+the difference between debugging for an hour and reading one message. It is
+published on every change and re-asserted about once a second, so a value going
+stale means the gateway itself is gone.
+
+`GatewayAction.stop` does not mean zero. A breached stop zone is *directional*:
+only the velocity heading into the obstacle is stripped, so the robot can still
+reverse or turn out of the zone. Only an obstacle that surrounds it, a stale
+LiDAR scan or a tripped watchdog collapses the command entirely.
 
 **Software can stop the robot; it cannot pretend to be the button.**
 `robot.emergency_stop()` publishes the cancel event that the safety node, the
@@ -147,6 +153,14 @@ submits a goal, gets an id back, and returns the `TaskResult` that id ends on �
 which can be `SUCCEEDED`, `BLOCKED`, `FAILED` or `CANCELED`. Only the first is
 arrival, and `BLOCKED` is not an error: the robot met the world and stopped.
 Check the result, do not assume it.
+
+**A map-frame coordinate is only valid while the map is.** If you store a
+pose and drive to it later, store `robot.map_id()` beside it and refuse the
+coordinate when the ids differ — nothing in a bare pose says which map it came
+from, so a rebuilt or re-sessioned map turns every saved coordinate into a
+confident drive to the wrong place. `map_id()` returns `None` for "no usable
+map" (SLAM down, odometry fallback, or nothing published), which never means
+"unchanged".
 
 **A task's lifecycle and what the skill is doing are different questions.**
 `TaskFeedback.state` is `RUNNING` for the whole task and never anything else —

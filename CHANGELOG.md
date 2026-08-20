@@ -38,6 +38,57 @@ query instead — `safety/state`, `system_state/vda` and `system_state/system`
 are backed by queryables. The flags stay so the day the producers upgrade
 nothing has to move.
 
+### Map identity, and the coordinates it keeps honest
+
+New topic `localization/map_identity` carrying `MapIdentity`, in the new
+`robodog_sdk.msgs.localization`. A map-frame coordinate only means something
+while the map is the same one, and nothing in a pose says which map that was —
+so anything persisting one (a saved spot, a landmark, a patrol route) has to
+record the map id beside it and refuse coordinates from another. Without it a
+rebuilt or re-sessioned map turns every stored coordinate into a confident
+drive to nowhere, with nothing in the data to say so.
+
+- `RobotClient.map_id()` returns the current id or `None`. `None` covers three
+  cases a caller should treat alike — nothing published, the identity gone
+  stale, or the producer saying it has no map (odometry fallback, SLAM down).
+  It never means "unchanged".
+- Every `MapIdentity` default is "I do not know where I am", so a payload only
+  partly understood cannot read as a valid map.
+- `FakeStack.set_map(...)` drives it in tests, including the `None` case.
+
+### Navigation: dwell, and an arrival heading that is finally honoured
+
+- **`NavigateThroughPosesGoal.dwell_sec`** — seconds to hold at each pose
+  before driving on, one entry per pose with the last ignored. Validated: a
+  mismatched length is silently ambiguous, so it is refused rather than guessed
+  at. `RobotClient.navigate_through(dwell_sec=[...])`.
+- **`orientation_at_target` / `final_orientation` are no longer decorative.**
+  They were on the wire and read by no skill: a goal asking to arrive facing a
+  heading finished on whatever the approach ended on and still reported
+  `SUCCEEDED`. Skills now rotate onto the requested heading and withhold
+  arrival until the yaw is within `arrival_orientation_deviation`. The goal
+  pose's own `theta` deliberately does **not** opt in — every pose carries one
+  as the approach hint, so it cannot double as "I care how I end up facing".
+- **`PlannedPath.align_final_heading` and `arrival_yaw_tolerance_rad`** carry
+  that opt-in to the tracker.
+- **`global_nav` drives multi-pose routes now**, planning to each pose in turn,
+  and is the skill that honours `dwell_sec`. It used to reject any route with
+  more than one pose, which is why this package recommended `waypoint_follow`
+  for routes; that advice is gone.
+
+### The gateway status is no longer edge-only
+
+`motion/gateway/status` re-asserts the current value on a heartbeat (~1 Hz)
+alongside its edges, so a late subscriber is at most one beat behind instead of
+waiting for a change that may never come. Its age is therefore meaningful:
+silence means the gateway is gone. `motion/collision/event` stays edge-only.
+
+**`GatewayAction.stop` no longer implies zero.** A breached stop zone is
+directional — only the velocity component heading into the obstacle is
+stripped, leaving receding motion and rotation, so the robot can back out
+instead of being trapped. Only being surrounded, a stale scan or a tripped
+watchdog collapses the command entirely.
+
 ### The safety path, which this package did not have
 
 The stack grew a safety aggregator: every panel publishes its own latch on

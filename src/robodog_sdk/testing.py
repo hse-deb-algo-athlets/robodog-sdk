@@ -27,6 +27,7 @@ import uuid
 
 from zenode import Node, publish, serve, subscribe
 
+from .msgs.localization import MapIdentity
 from .msgs.motion import (
     GatewayAction,
     MotionGatewayStatus,
@@ -224,6 +225,7 @@ class FakeStack(Node):
 
     odometry = publish(StateTopics.odometry)
     localization = publish(LocalizationTopics.pose)
+    map_identity = publish(LocalizationTopics.map_identity)
     battery = publish(StateTopics.battery)
     system = publish(StateTopics.system)
     gateway = publish(ControlTopics.status)
@@ -243,6 +245,7 @@ class FakeStack(Node):
         self.cancels = []
         self.odometry.put(OdometryState())
         self.localization.put(OdometryState())
+        self.map_identity.put(MapIdentity(map_id="fake-map", source="fake-stack", reachable=True))
         self.battery.put(BatteryState(soc=87, level=BatteryLevel.good, voltage=28.4))
         self.gateway.put(MotionGatewayStatus(active_source=None))
         self.system.put(SystemState(posture=Posture.STANDING))
@@ -274,6 +277,21 @@ class FakeStack(Node):
     def set_battery(self, soc: int, level: BatteryLevel = BatteryLevel.good) -> None:
         """Publish a new battery state."""
         self.battery.put(BatteryState(soc=soc, level=level))
+
+    def set_map(self, map_id: str | None, *, reachable: bool = True) -> None:
+        """Publish a map identity — which map poses are anchored to.
+
+        ``map_id=None`` is the case worth testing: it is what a node sees when
+        SLAM is down or the odometry fallback is driving, and a node that
+        treats it as "unchanged" will happily drive to a stored coordinate
+        that no longer means anything::
+
+            stack.set_map("hall-b")
+            ...
+            stack.set_map(None)     # SLAM went away
+            stack.set_map("hall-c") # somebody loaded a different map
+        """
+        self.map_identity.put(MapIdentity(map_id=map_id, source="fake-stack", reachable=reachable))
 
     def set_safety(
         self,

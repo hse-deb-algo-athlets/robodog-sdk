@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, RootModel
+from pydantic import BaseModel, Field, RootModel, model_validator
 
 
 def _utcnow() -> datetime:
@@ -204,9 +204,18 @@ class NavigateToPoseGoal(BaseModel):
     max_speed: float | None = None
     #: m — how close to ``target`` counts as arrived.
     arrival_deviation: float = 0.15
-    #: rad — heading tolerance, only meaningful with ``orientation_at_target``.
+    #: rad — the yaw tolerance arrival is gated on. Only meaningful alongside
+    #: ``orientation_at_target``.
     arrival_orientation_deviation: float = 0.1
-    #: rad. ``None`` leaves the final heading a don't-care.
+    #: rad — the heading to finish on. This field, and not ``target.theta``,
+    #: is what says "I care how I end up facing": a pose always carries a
+    #: theta, so that one is the approach hint and cannot double as the intent.
+    #:
+    #: Set, the skill rotates onto this heading and withholds arrival until
+    #: the yaw is within ``arrival_orientation_deviation``. ``None`` leaves
+    #: arrival position-only, and the robot finishes on whatever heading the
+    #: approach ended on — which is what stops it fussing in place at a goal
+    #: nobody cared about.
     orientation_at_target: float | None = None
     #: Skill to run this goal. ``None`` uses the deployment's default skill.
     skill: str | None = None
@@ -226,6 +235,9 @@ class NavigateThroughPosesGoal(BaseModel):
     max_speed: float | None = None
     arrival_deviation: float = 0.15
     arrival_orientation_deviation: float = 0.1
+    #: rad — the heading to finish the route on. As
+    #: :attr:`NavigateToPoseGoal.orientation_at_target`, and applying only to
+    #: the last pose: intermediate via-points are always position-only.
     final_orientation: float | None = None
     skill: str | None = None
     #: Half-width in metres of the released corridor around the ``poses``
@@ -237,6 +249,33 @@ class NavigateThroughPosesGoal(BaseModel):
     #: it is — which is the right answer for a one-off local goal, and the
     #: wrong one for a fleet order whose route was chosen for a reason.
     corridor_deviation_m: float | None = None
+    #: Seconds to hold at each pose after arriving, before driving on. One
+    #: entry per pose, and the last one is ignored — the task ends there, so
+    #: there is nothing to wait for. ``None`` drives straight through.
+    #:
+    #: Honoured by ``global_nav``, which drives the route leg by leg and so
+    #: has a natural stop at each waypoint. ``waypoint_follow`` ignores it: its
+    #: polyline is one continuous drive with nowhere to wait.
+    dwell_sec: list[float] | None = None
+
+    @model_validator(mode="after")
+    def _check_dwell(self) -> NavigateThroughPosesGoal:
+        """Reject a dwell list that cannot be matched to the route.
+
+        A mismatched length is silently ambiguous — there is no way to tell
+        which poses the entries were meant for — so it is refused here rather
+        than guessed at by the skill.
+        """
+        if self.dwell_sec is None:
+            return self
+        if len(self.dwell_sec) != len(self.poses):
+            raise ValueError(
+                f"dwell_sec has {len(self.dwell_sec)} entries but there are "
+                f"{len(self.poses)} poses — provide exactly one dwell per pose"
+            )
+        if any(d < 0 for d in self.dwell_sec):
+            raise ValueError("dwell_sec entries must be >= 0")
+        return self
 
 
 #: What ``nav/task/submit`` accepts, discriminated on ``kind``.
@@ -411,6 +450,19 @@ class PlannedPath(BaseModel):
     #: and reactive driving, so a subscriber sees the mode change as a new
     #: path rather than having to infer it.
     skill: str | None = None
+    #: Whether the tracker must land on the terminal waypoint's ``theta`` as a
+    #: commanded heading — rotating in place if it has to, and withholding
+    #: arrival until the yaw is within :attr:`arrival_yaw_tolerance_rad`.
+    #:
+    #: This is how a goal's ``orientation_at_target`` / ``final_orientation``
+    #: reaches the tracker. A skill sets it only when the client asked for a
+    #: heading; ``False`` keeps arrival position-only and the terminal theta
+    #: is ignored.
+    align_final_heading: bool = False
+    #: rad — the yaw tolerance arrival is gated on, paired with
+    #: :attr:`align_final_heading`. ``None`` leaves the tracker on its own
+    #: configured tolerance.
+    arrival_yaw_tolerance_rad: float | None = None
 
 
 # ------------------------------------------------------------------ safety

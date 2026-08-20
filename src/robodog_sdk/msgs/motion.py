@@ -158,7 +158,15 @@ class GatewayAction(StrEnum):
     ``pass_through`` — nothing in the way; the command went out unchanged.
     ``limit`` — a limit zone capped one or more velocity components.
     ``slowdown`` — a slowdown zone scaled the whole command by a factor < 1.
-    ``stop`` — a stop zone, a stale LiDAR scan, or the watchdog forced zero.
+    ``stop`` — a stop zone, a stale LiDAR scan, or the watchdog intervened.
+
+    ``stop`` does not always mean zero. A breached stop zone is *directional*:
+    the gateway strips only the velocity heading into the obstacle, leaving
+    motion away from it and rotation intact, so the robot can still reverse or
+    turn out of the zone rather than being trapped in it. Only an obstacle that
+    surrounds the robot, or a stale scan or tripped watchdog, collapses the
+    command entirely. Read ``active_zones`` for which zones are breached, not
+    this, if the question is what the robot may still do.
     """
 
     pass_through = "pass_through"

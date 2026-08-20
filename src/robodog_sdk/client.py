@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Generic, TypeVar
 from zenode import Node, ServiceError, ServiceTimeout, TransportConfig
 from zenode.service import call_service
 
+from .msgs.localization import MapIdentity
 from .msgs.motion import (
     ActionCommand,
     ActionType,
@@ -124,11 +125,11 @@ class StateView:
 
     Every field is a :class:`Latest`, and age is exposed rather than hidden
     because most of these are only as true as they are recent. The robot state
-    streams continuously, so a stale value means the producer stopped;
+    streams continuously, so a stale value means the producer stopped, and
     navigation feedback exists only while a task runs, so its age is what tells
-    you whether one does; the gateway and safety values are edge-published, so
-    their age is the time since the last *change* and says nothing about
-    liveness.
+    you whether one does. The gateway and safety values change on edges but are
+    re-asserted on a heartbeat, so their age is meaningful too — silence for
+    several seconds means the producer is gone.
     """
 
     def __init__(self) -> None:
@@ -137,13 +138,17 @@ class StateView:
         #: The fused pose, from SLAM or the odometry fallback. This is the one
         #: navigation goals are expressed in; :attr:`odometry` drifts.
         self.localization: Latest[OdometryState] = Latest()
+        #: Which map :attr:`localization` is anchored to. Required reading for
+        #: anything that stores a map-frame coordinate and uses it later — see
+        #: :meth:`RobotClient.map_id`.
+        self.map_identity: Latest[MapIdentity] = Latest()
         self.battery: Latest[BatteryState] = Latest()
         self.highstate: Latest[RobotHighState] = Latest()
         #: Most recent :class:`TaskFeedback`, from whichever task published it.
         self.nav: Latest[TaskFeedback] = Latest()
         #: The gateway's last decision: who is driving, and what was done to
-        #: their command. Edge-published, so its age is the time since the last
-        #: change, not the time since the last tick.
+        #: their command. Published on change and re-asserted about once a
+        #: second, so a value going stale means the gateway stopped.
         self.gateway: Latest[MotionGatewayStatus] = Latest()
         #: The safety latch — the authority on whether the robot may move at
         #: all. Republished on a heartbeat as well as on change, so unlike the
@@ -195,6 +200,9 @@ class RobotClient:
 
         node.subscribe(StateTopics.odometry, self.state.odometry.update, mode="latest")
         node.subscribe(LocalizationTopics.pose, self.state.localization.update, mode="latest")
+        node.subscribe(
+            LocalizationTopics.map_identity, self.state.map_identity.update, mode="latest"
+        )
         node.subscribe(StateTopics.battery, self.state.battery.update, mode="latest")
         node.subscribe(StateTopics.highstate, self.state.highstate.update, mode="latest")
         node.subscribe(StateTopics.system, self.state.system.update, mode="latest")
@@ -306,6 +314,30 @@ class RobotClient:
             return False
         return latch.motion_permitted
 
+    def map_id(self, *, within: float = 30.0) -> str | None:
+        """The map the current pose stream is anchored to, or ``None``.
+
+        Store this alongside any map-frame coordinate you intend to use later,
+        and refuse the coordinate when the ids differ. A pose is only
+        comparable to a stored one while the map is the same, and nothing in a
+        bare pose says which map that was — so without this a rebuilt map turns
+        every saved coordinate into a confident drive to the wrong place.
+
+        ``None`` means **no usable map**, and covers three cases a caller
+        should treat alike: nothing has been published, the last identity is
+        older than ``within``, or the producer says it has no map (the odometry
+        fallback, or SLAM down). It never means "unchanged".
+
+        Args:
+            within: Seconds. An identity older than this is treated as absent.
+                Generous by default — it is republished with the global
+                costmap, which is not a fast key.
+        """
+        identity = self.state.map_identity.value
+        if identity is None or not self.state.map_identity.fresh(within=within):
+            return None
+        return identity.map_id
+
     # -------------------------------------------------------------- commands
 
     def move(self, x: float = 0.0, y: float = 0.0, z_deg: float = 0.0) -> None:
@@ -411,10 +443,11 @@ class RobotClient:
         Args:
             x: Target x in the ``map`` frame, m.
             y: Target y in the ``map`` frame, m.
-            heading: Requested orientation on arrival, rad. ``None`` leaves the
-                final heading a don't-care. Requested, not guaranteed: a skill
-                configured to arrive on position alone ignores it rather than
-                turning on the spot at the goal.
+            heading: Orientation to finish on, rad. The robot rotates onto it
+                and does not report arrival until the yaw is within tolerance.
+                ``None`` leaves the final heading a don't-care and arrival is
+                position-only, which is what stops it fussing in place at a
+                goal nobody cared about.
             timeout: Seconds to wait for a terminal state. ``None`` waits
                 indefinitely, which is what a skill that waits out an obstacle
                 rather than giving up requires.
@@ -462,19 +495,20 @@ class RobotClient:
         preempt: bool = False,
         on_estop: EstopPolicy = EstopPolicy.CANCEL,
         corridor_deviation_m: float | None = None,
+        dwell_sec: Sequence[float] | None = None,
     ) -> TaskResult:
         """Navigate a route through several poses and wait for the outcome.
 
         Args:
             poses: The route, in order; the last one is the target. Accepts
                 :class:`Pose2D` or plain ``(x, y)`` pairs.
-            final_heading: Requested orientation at the last pose, rad.
+            final_heading: Orientation to finish the route on, rad. Applies to
+                the last pose only — intermediate ones are position-only.
             timeout: As :meth:`navigate_to`.
             max_speed: As :meth:`navigate_to`.
-            skill: As :meth:`navigate_to`. A skill that plans for itself may
-                route to the last pose directly instead of following the
-                intermediate ones — pass ``"waypoint_follow"`` when the route
-                is the point.
+            skill: As :meth:`navigate_to`. The default plans to each pose in
+                turn; ``"waypoint_follow"`` drives the polyline as one
+                continuous motion without planning.
             preempt: As :meth:`navigate_to`.
             on_estop: As :meth:`navigate_to`.
             corridor_deviation_m: Half-width in metres of the corridor around
@@ -482,6 +516,13 @@ class RobotClient:
                 have it resume. ``None`` lets it resume from anywhere, which
                 is fine for a route that was a convenience and wrong for one
                 that was a decision.
+            dwell_sec: Seconds to hold at each pose before driving on — one
+                entry per pose, the last ignored. Needs a skill that stops at
+                each waypoint, so ``"waypoint_follow"`` ignores it.
+
+        Raises:
+            pydantic.ValidationError: ``dwell_sec`` does not have exactly one
+                non-negative entry per pose.
         """
         goal = NavigateThroughPosesGoal(
             poses=[
@@ -491,6 +532,7 @@ class RobotClient:
             max_speed=max_speed,
             skill=skill,
             corridor_deviation_m=corridor_deviation_m,
+            dwell_sec=list(dwell_sec) if dwell_sec is not None else None,
         )
         return await self.run_goal(goal, timeout=timeout, preempt=preempt, on_estop=on_estop)
 

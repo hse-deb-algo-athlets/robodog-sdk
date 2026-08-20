@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from pydantic import ValidationError
 from zenode import Node
 from zenode.errors import ServiceError
 from zenode.testing import harness
@@ -488,3 +489,62 @@ async def test_stack_nodes_are_not_waitable_by_presence() -> None:
         await agent.robot.wait_until_ready("nav", timeout=5.0)  # the double, not the stack
         with pytest.raises(ValueError):
             await agent.robot.wait_until_ready()
+
+
+async def test_the_map_identity_reaches_the_state_view() -> None:
+    async with harness() as h:
+        agent, stack = await _agent_with_stack(h)
+
+        stack.set_map("hall-b_2026-07")
+        await asyncio.sleep(0.2)
+
+        assert agent.robot.map_id() == "hall-b_2026-07"
+
+
+async def test_no_map_is_reported_as_none_rather_than_the_last_one() -> None:
+    """A stored map-frame coordinate is only usable while the map is the same.
+    "SLAM is down" must not read as "still the map you remember"."""
+    async with harness() as h:
+        agent, stack = await _agent_with_stack(h)
+
+        stack.set_map("hall-b_2026-07")
+        await asyncio.sleep(0.2)
+        remembered = agent.robot.map_id()
+
+        stack.set_map(None)  # odometry fallback, or SLAM gone
+        await asyncio.sleep(0.2)
+
+        assert remembered == "hall-b_2026-07"
+        assert agent.robot.map_id() is None
+
+
+async def test_a_stale_map_identity_is_not_a_map() -> None:
+    async with harness() as h:
+        agent, stack = await _agent_with_stack(h)
+
+        stack.set_map("hall-b_2026-07")
+        await asyncio.sleep(0.2)
+
+        assert agent.robot.map_id(within=0.0) is None
+
+
+async def test_a_route_carries_its_dwells() -> None:
+    async with harness() as h:
+        agent, nav = await _agent_with_nav(h)
+
+        await agent.robot.navigate_through(
+            [(1.0, 0.0), (2.0, 0.0), (3.0, 0.0)], dwell_sec=[0.0, 5.0, 0.0], timeout=5.0
+        )
+
+        goal = nav.last_goal
+        assert isinstance(goal, NavigateThroughPosesGoal)
+        assert goal.dwell_sec == [0.0, 5.0, 0.0]
+
+
+async def test_a_dwell_that_does_not_match_the_route_is_refused() -> None:
+    """Which poses the entries belong to would otherwise be a guess."""
+    async with harness() as h:
+        agent, _ = await _agent_with_nav(h)
+
+        with pytest.raises(ValidationError):
+            await agent.robot.navigate_through([(1.0, 0.0), (2.0, 0.0)], dwell_sec=[1.0])

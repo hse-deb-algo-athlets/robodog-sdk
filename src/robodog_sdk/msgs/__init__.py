@@ -9,6 +9,7 @@ the CHANGELOG: ``camera.py`` / ``image.py`` (JPEG frame envelopes) and
 from __future__ import annotations
 
 from .input import AnalogInput, Axis, Buttons, GamepadState, GamepadStatus
+from .localization import MapIdentity
 from .motion import (
     ActionCommand,
     ActionType,
@@ -92,6 +93,7 @@ __all__ = [
     "Headline",
     "IMUState",
     "Location",
+    "MapIdentity",
     "MotionGatewayStatus",
     "MotorState",
     "MovementCommand",

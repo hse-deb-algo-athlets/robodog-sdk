@@ -38,6 +38,7 @@ from __future__ import annotations
 from zenode import Service, Topic, TopicSet
 
 from .msgs.input import GamepadState, GamepadStatus
+from .msgs.localization import MapIdentity
 from .msgs.motion import (
     ActionCommand,
     EmergencyStopCommand,
@@ -123,10 +124,16 @@ class PoseTopics(TopicSet):
 class ControlTopics(TopicSet):
     """Who is driving, and why the robot is not moving.
 
-    One key, edge-published: the gateway emits a
-    :class:`~robodog_sdk.msgs.motion.MotionGatewayStatus` when the active
-    source changes, when a collision zone fires or clears, or when the watchdog
-    trips — not on every tick. Between edges the last value stands.
+    One key. The gateway publishes on every change — the active source, a
+    collision zone firing or clearing, the watchdog tripping — and re-asserts
+    the current value on a heartbeat, about once a second, so a late subscriber
+    is at most one beat behind rather than waiting for a change that may never
+    come. Between beats the last value stands.
+
+    The heartbeat is what makes the age of this value meaningful: silence for
+    several seconds means the gateway itself is gone, not that nothing has
+    changed. :attr:`SafetyTopics.collision_zone` is the opposite — edge-only,
+    where age says nothing.
 
     This is the first thing to read when commands go out and nothing happens.
     ``active_source`` names who won, ``action`` and ``active_zones`` say what
@@ -139,7 +146,7 @@ class ControlTopics(TopicSet):
         "motion/gateway/status",
         MotionGatewayStatus,
         latched=True,
-        description="Edge-published: the gateway's decision, and its reason",
+        description="The gateway's decision and its reason; on change, plus a ~1 Hz heartbeat",
     )
 
 
@@ -283,6 +290,12 @@ class LocalizationTopics(TopicSet):
     ``zenoh-bridge-ros2dds`` — is not part of this contract. It is internal to
     that container, carries a different wire format, and is not what a
     consumer of the robot's pose should subscribe to.
+
+    :attr:`map_identity` says which map that pose is anchored to, and anything
+    storing a map-frame coordinate needs it. A pose is only comparable to a
+    stored one while the map is the same; nothing in a bare pose says
+    otherwise, so a rebuilt map silently turns every saved coordinate into a
+    confident drive to the wrong place.
     """
 
     pose = Topic(
@@ -292,6 +305,12 @@ class LocalizationTopics(TopicSet):
         trace=True,
         trace_ratio=TRACE_RATIO,
         description="Trace root: neither producer is a zenode node, so no context arrives",
+    )
+    map_identity = Topic(
+        "localization/map_identity",
+        MapIdentity,
+        latched=True,
+        description="Which map `pose` is anchored to; republished with the global costmap",
     )
 
 
@@ -384,7 +403,7 @@ class NavTopics(TopicSet):
         "nav/costmap/global",
         CostMap,
         latched=True,
-        description="The deployment map, already inflated by the robot radius",
+        description="The active MOLA session's map, already inflated by the robot radius",
     )
     costmap_local = Topic(
         "nav/costmap/local",
@@ -413,10 +432,13 @@ class NavServices(TopicSet):
     ``global_nav`` (plans through the global map, and the default),
     ``corridor_assist`` (plans, but hands the wheel to a reactive controller
     through the tight bits), ``waypoint_follow`` (drives the route it was
-    given, without planning), ``door_traverse`` and ``dummy``. They do not all
-    read the same goal fields: a planning skill may treat the intermediate
-    poses of a :class:`~robodog_sdk.msgs.navigation.NavigateThroughPosesGoal`
-    as advisory and route to the last one itself.
+    given, without planning), ``door_traverse`` and ``dummy``.
+
+    They do not all read the same goal fields. ``global_nav`` drives a route
+    leg by leg, planning to each pose in turn, and is the only skill that
+    honours ``dwell_sec``; ``waypoint_follow`` drives the polyline as one
+    continuous motion, which is why a dwell has nowhere to happen. Both honour
+    the requested arrival heading, and both apply it only to the final pose.
 
     A pub/sub adapter (``nav/simple/{goto,cancel,status}``) exists on the stack
     for clients that cannot speak this contract at all — untyped JSON, no

@@ -13,10 +13,12 @@ from zenode import registered_services, registered_topics
 import robodog_sdk  # noqa: F401  — importing registers the TopicSets
 from robodog_sdk import (
     EstopPhase,
+    MapIdentity,
     MovementCommand,
     MovementSource,
     NavigateThroughPosesGoal,
     NavigateToPoseGoal,
+    PlannedPath,
     Pose2D,
     SafetyState,
     TaskFeedback,
@@ -25,6 +27,7 @@ from robodog_sdk import (
 )
 from robodog_sdk.topics import (
     ControlTopics,
+    LocalizationTopics,
     MotionTopics,
     NavServices,
     NavTopics,
@@ -110,8 +113,10 @@ def test_a_default_command_cannot_outrank_a_human() -> None:
 
 
 def test_gateway_status_is_latched() -> None:
-    """It is edge-published, so a late joiner would otherwise learn who is
-    driving only at the next change — which may never come."""
+    """It changes on edges, so a late joiner would otherwise learn who is
+    driving only at the next change — which may never come. The gateway also
+    re-asserts it on a heartbeat; the two cover different failure modes and
+    neither replaces the other."""
     assert ControlTopics.status.latched
 
 
@@ -135,6 +140,30 @@ def test_motion_is_denied_while_the_robot_is_standing_back_up() -> None:
     releasing = SafetyState(estop=False, source_alive=True, phase=EstopPhase.RELEASING)
     assert not releasing.estop
     assert not releasing.motion_permitted
+
+
+def test_an_unpopulated_map_identity_is_not_a_map() -> None:
+    """A partly-understood payload must fail closed. Defaulting ``map_id`` to
+    anything but ``None`` would let stored coordinates be driven against a map
+    nobody confirmed."""
+    identity = MapIdentity()
+    assert identity.map_id is None
+    assert identity.reachable is False
+
+
+def test_no_map_is_distinguishable_from_no_answer() -> None:
+    """Two "no map" answers a consumer must not conflate: a producer that
+    answered and has no map will not gain one by waiting, whereas a producer
+    that never published shows up as a stale stamp instead."""
+    answered = MapIdentity(source="nav", state="no_global_map", reachable=True)
+    assert answered.map_id is None
+    assert answered.reachable
+
+
+def test_the_map_identity_is_latched() -> None:
+    """Anything storing a map-frame coordinate needs the map before it can use
+    one, so a late joiner cannot be made to wait for the next republish."""
+    assert LocalizationTopics.map_identity.latched
 
 
 def test_a_safety_source_key_matches_the_wildcard_the_aggregator_watches() -> None:
@@ -161,7 +190,8 @@ def test_task_result_is_not_latched() -> None:
 
 
 def test_global_costmap_is_latched() -> None:
-    """The map is published once at startup; a late joiner still needs it."""
+    """It is republished slowly, so a late joiner would otherwise plan blind
+    until the next period."""
     assert NavTopics.costmap_global.latched
 
 
@@ -199,6 +229,26 @@ def test_terminal_states_are_exactly_the_four_endings() -> None:
         TaskState.CANCELED,
         TaskState.BLOCKED,
     }
+
+
+def test_a_dwell_must_name_the_pose_it_belongs_to() -> None:
+    """A mismatched dwell list is silently ambiguous — there is no way to tell
+    which poses the entries were meant for — so it is refused, not guessed."""
+    poses = [Pose2D(x=float(i), y=0.0, theta=0.0) for i in range(3)]
+    assert NavigateThroughPosesGoal(poses=poses, dwell_sec=[0.0, 2.0, 0.0]).dwell_sec
+    assert NavigateThroughPosesGoal(poses=poses).dwell_sec is None
+    with pytest.raises(ValidationError):
+        NavigateThroughPosesGoal(poses=poses, dwell_sec=[1.0])
+    with pytest.raises(ValidationError):
+        NavigateThroughPosesGoal(poses=poses, dwell_sec=[0.0, -1.0, 0.0])
+
+
+def test_a_goal_pose_theta_does_not_ask_for_an_arrival_heading() -> None:
+    """Every pose carries a theta — the approach hint — so it cannot double as
+    "I care how I end up facing". Only the dedicated field opts in."""
+    goal = NavigateToPoseGoal(target=Pose2D(x=1.0, y=0.0, theta=1.57))
+    assert goal.orientation_at_target is None, "a theta alone is a don't-care"
+    assert not PlannedPath(task_id="t", waypoints=[]).align_final_heading
 
 
 @pytest.mark.parametrize(
