@@ -1,0 +1,51 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Verify tag matches pyproject version
+        run: |
+          VERSION=$(uv run --no-project python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match pyproject version $VERSION"
+            exit 1
+          fi
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      # Tests run against the built wheel, not the source tree, so packaging
+      # bugs (missing py.typed, missing subpackage) fail the release. zenode is
+      # not on PyPI, so the isolated resolve needs the git pin spelled out —
+      # keep the tag in sync with [tool.uv.sources] in pyproject.toml.
+      - name: Test the built wheel
+        run: >
+          uv run --isolated --no-project
+          --with "$(ls dist/*.whl)"
+          --with "zenode @ git+https://github.com/hse-deb-algo-athlets/zenode.git@v0.1.0"
+          --with pytest --with pytest-asyncio
+          pytest -q
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
+
+  # PyPI publishing (planned): add a `publish` job here using
+  # pypa/gh-action-pypi-publish with Trusted Publishing (OIDC) —
+  # `permissions: id-token: write`, no API token. Register this workflow as a
+  # trusted publisher on PyPI first. Requires zenode on PyPI too: a wheel
+  # depending on a git URL cannot be uploaded.

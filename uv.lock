@@ -1064,7 +1064,7 @@ requires-dist = [
     { name = "numpy", marker = "extra == 'livox'", specifier = ">=2.0" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "rosbags", marker = "extra == 'livox'", specifier = ">=0.11.3" },
-    { name = "zenode", git = "https://github.com/hse-deb-algo-athlets/zenode.git" },
+    { name = "zenode", git = "https://github.com/hse-deb-algo-athlets/zenode.git?tag=v0.1.0" },
 ]
 provides-extras = ["livox"]
 
@@ -1368,7 +1368,7 @@ wheels = [
 [[package]]
 name = "zenode"
 version = "0.1.0"
-source = { git = "https://github.com/hse-deb-algo-athlets/zenode.git#63e656ea7e15e51f8b283b13b389db6202beb46b" }
+source = { git = "https://github.com/hse-deb-algo-athlets/zenode.git?tag=v0.1.0#20a10e6b234260091322c07106fac48733fb7b66" }
 dependencies = [
     { name = "eclipse-zenoh" },
     { name = "pydantic" },
