@@ -18,7 +18,7 @@ and the packaging decision: ADR-010 in the robodog-digipro repository.
 ## Install
 
 ```bash
-uv add "robodog-sdk @ git+https://github.com/hse-deb-algo-athlets/robodog-sdk@v0.1.0"
+uv add "robodog-sdk @ git+https://github.com/hse-deb-algo-athlets/robodog-sdk@v0.2.0"
 ```
 
 Two dependencies (`zenode`, `pydantic`), no hardware or simulation packages.

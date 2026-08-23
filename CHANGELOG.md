@@ -5,6 +5,8 @@ Semantic versioning; `0.x` minor versions may move keys.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-23
+
 ### The contract now says what the stack actually does
 
 This package was written to a key scheme the stack was expected to adopt and
