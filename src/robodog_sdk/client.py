@@ -330,8 +330,9 @@ class RobotClient:
 
         Args:
             within: Seconds. An identity older than this is treated as absent.
-                Generous by default — it is republished with the global
-                costmap, which is not a fast key.
+                Generous by default — the producer re-states it about every
+                5 s, so this leaves several beats of margin. Lower it only if
+                you know the deployment beats faster.
         """
         identity = self.state.map_identity.value
         if identity is None or not self.state.map_identity.fresh(within=within):

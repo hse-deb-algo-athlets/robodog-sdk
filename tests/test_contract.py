@@ -13,6 +13,7 @@ from zenode import registered_services, registered_topics
 import robodog_sdk  # noqa: F401  — importing registers the TopicSets
 from robodog_sdk import (
     EstopPhase,
+    GridMap,
     MapIdentity,
     MovementCommand,
     MovementSource,
@@ -28,6 +29,7 @@ from robodog_sdk import (
 from robodog_sdk.topics import (
     ControlTopics,
     LocalizationTopics,
+    MapTopics,
     MotionTopics,
     NavServices,
     NavTopics,
@@ -266,3 +268,81 @@ def test_goal_roundtrips_through_the_submit_service(goal) -> None:
     wire = codec.encode(TaskGoalEnvelope(goal))
     assert b'"kind":' in wire
     assert codec.decode(wire).goal == goal
+
+
+# ── the map grid ────────────────────────────────────────────────────────────
+
+#: One `map/grid` payload exactly as the MOLA control plane emits it, captured
+#: from a real session. MOLA cannot import this package — it runs on the ROS 2
+#: Humble image, whose Python is older than this package supports — so it
+#: hand-writes this JSON, and nothing but this fixture stands between a field
+#: renamed here and a map that silently stops decoding on the robot. The PNG is
+#: a 4x3 greyscale raster: a wall around two free cells.
+MOLA_GRID_PAYLOAD = (
+    r'{"map_id": "session1", "revision": "W/\"3706-1752163200\"",'
+    r' "resolution": 0.05000000074505806,'
+    r' "origin_x": -6.400000095367432, "origin_y": -5.25, "origin_theta": 0.0,'
+    r' "width": 4, "height": 3,'
+    r' "occupied_thresh": 0.65, "free_thresh": 0.196, "negate": false,'
+    r' "image_png": "iVBORw0KGgoAAAANSUhEUgAAAAQAAAADCAAAAACRn/EaAAAAD0lEQVR4nGNg'
+    r'AIN//yA0AA7xAf15n65LAAAAAElFTkSuQmCC",'
+    r' "source": "mola", "stamp": "2026-07-10T18:00:00+00:00"}'
+)
+
+
+def test_the_map_grid_is_latched() -> None:
+    """It is published on change and never on a timer, so a consumer that is
+    not latched into the cache waits for a remap that may never come."""
+    assert MapTopics.grid.latched
+
+
+def test_the_map_identity_is_latched_and_agrees_with_the_grid() -> None:
+    """Both come from the localization source, so a consumer that has one has
+    the other — and neither makes a late joiner wait for a change."""
+    assert LocalizationTopics.map_identity.latched
+    assert MapTopics.grid.latched
+
+
+def test_a_mola_payload_decodes() -> None:
+    """The contract as the producer actually writes it."""
+    grid = MapTopics.grid.codec.decode(MOLA_GRID_PAYLOAD.encode())
+    assert grid.map_id == "session1"
+    assert (grid.width, grid.height) == (4, 3)
+    assert grid.resolution == pytest.approx(0.05)
+    assert (grid.origin_x, grid.origin_y) == pytest.approx((-6.4000000954, -5.25))
+    assert grid.available
+    assert grid.png_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_an_empty_grid_map_is_no_map() -> None:
+    """Every default has to read as "I cannot draw you a map", so a payload
+    that is only partly understood is never mistaken for a usable one."""
+    empty = GridMap()
+    assert not empty.available
+    assert empty.map_id is None
+    assert empty.png_bytes() == b""
+
+
+def test_a_session_without_a_grid_is_not_a_missing_session() -> None:
+    """Mapping in progress: the frame is live, the raster does not exist yet.
+    A consumer holding map-frame coordinates must not read this as "no map"
+    and throw them away."""
+    building = GridMap(map_id="hall-b_2026-07")
+    assert building.map_id == "hall-b_2026-07"
+    assert not building.available
+
+
+def test_occupancy_thresholds_follow_map_server() -> None:
+    """Dark is occupied, light is free, and the band between is unknown —
+    getting this backwards reads every wall as open floor."""
+    grid = GridMap(occupied_thresh=0.65, free_thresh=0.196)
+    assert grid.is_occupied(0) and not grid.is_free(0)
+    assert grid.is_free(255) and not grid.is_occupied(255)
+    assert not grid.is_occupied(128) and not grid.is_free(128)
+
+
+def test_negate_inverts_the_greyscale() -> None:
+    """The flag is on the message because the raster may carry either
+    convention; a consumer doing its own arithmetic has to honour it."""
+    assert GridMap(negate=True).is_free(0)
+    assert GridMap(negate=True).is_occupied(255)
