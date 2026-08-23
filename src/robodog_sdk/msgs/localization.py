@@ -22,9 +22,10 @@ def _utcnow() -> datetime:
 class MapIdentity(BaseModel):
     """Which map the current pose stream is anchored to, if any.
 
-    Published alongside the global costmap rather than once at startup, so a
-    late joiner learns the map within one period and can tell a current answer
-    from a stale one by :attr:`stamp`.
+    Published by the localization source itself — it is the only thing that
+    knows what frame it is emitting poses in. Latched, so a late joiner has it
+    on subscribe, and re-stated on a slow heartbeat, so :attr:`stamp` separates
+    "nothing has changed" from "the source is gone".
 
     Every default is "I do not know where I am", so a payload that is only
     partly understood cannot read as a valid map to drive stored coordinates

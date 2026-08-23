@@ -57,7 +57,7 @@ from .msgs.navigation import (
     TaskResult,
     TaskStatusRequest,
 )
-from .msgs.occupancy import CostMap
+from .msgs.occupancy import CostMap, GridMap
 from .msgs.robot import BatteryState, MotorState, OdometryState, RobotHighState
 from .msgs.safety import ButtonEvent, SafetyState
 from .msgs.system_state import SystemState, VdaFacet
@@ -296,6 +296,18 @@ class LocalizationTopics(TopicSet):
     stored one while the map is the same; nothing in a bare pose says
     otherwise, so a rebuilt map silently turns every saved coordinate into a
     confident drive to the wrong place.
+
+    Both keys come from whatever is localising — MOLA, or the odometry
+    fallback, which publishes only :attr:`pose` and no identity at all. That
+    silence is the correct answer there: odometry has no map. :attr:`grid
+    <MapTopics.grid>` carries the raster of the same map, and agrees with
+    :attr:`map_identity` on ``map_id`` because one producer publishes both.
+
+    :attr:`map_identity` is latched *and* re-stated on a slow heartbeat, unlike
+    the grid, which is change-only. The heartbeat is what makes its age mean
+    something: a consumer treats an identity older than its threshold as "no
+    usable map", so silence here has to say the pose source is gone rather than
+    that nothing has changed. See :meth:`~robodog_sdk.RobotClient.map_id`.
     """
 
     pose = Topic(
@@ -310,7 +322,38 @@ class LocalizationTopics(TopicSet):
         "localization/map_identity",
         MapIdentity,
         latched=True,
-        description="Which map `pose` is anchored to; republished with the global costmap",
+        description="Which map `pose` is anchored to; on change, plus a ~0.2 Hz heartbeat",
+    )
+
+
+class MapTopics(TopicSet):
+    """The map the deployment is operating in, as SLAM built it.
+
+    Published by the SLAM stack itself rather than relayed by a consumer, so
+    the map is on the bus whenever SLAM is — not only while the navigation
+    node happens to be running. It is what makes reading the map a
+    subscription instead of a call to MOLA's HTTP control API.
+
+    Latched and event-driven: it is published when a grid is rebuilt and when
+    the active session changes, and never on a timer. A late joiner gets the
+    current map on subscribe, so there is no window to wait through and no
+    keep-alive traffic in between. That also means :attr:`~GridMap.stamp` is
+    the age of the last *change*, not of the last heartbeat — an old stamp on
+    this key is normal and says nothing about whether SLAM is alive. Read
+    :attr:`LocalizationTopics.pose` for that.
+
+    :attr:`grid` is the raw grid. The navigation node's inflated view of the
+    same map is :attr:`NavTopics.costmap_global`, and the two agree on
+    :attr:`~GridMap.map_id` — when they disagree, one of them has not caught
+    up with a remap yet, and the map-frame coordinates you hold belong to
+    whichever is older.
+    """
+
+    grid = Topic(
+        "map/grid",
+        GridMap,
+        latched=True,
+        description="The SLAM session's occupancy grid; on rebuild and on session change",
     )
 
 

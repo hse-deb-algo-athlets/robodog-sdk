@@ -38,6 +38,69 @@ query instead — `safety/state`, `system_state/vda` and `system_state/system`
 are backed by queryables. The flags stay so the day the producers upgrade
 nothing has to move.
 
+### `map_identity` now comes from the thing that produces the pose
+
+The key says what the poses on `localization/pose` are expressed against, and
+it was being answered by the navigation node — which consumes those poses
+rather than producing them, and learned the answer by polling MOLA's HTTP API
+every 15 s. In the window after a remap the pose was already in the new frame
+while the identity still named the old one, which is precisely the failure the
+key exists to prevent. MOLA publishes it now; nav does not.
+
+The attribute and the key are unchanged. What changed is what arrives in it:
+
+- **`source` is `"mola"`**, not `"nav"` — which is what the field always asked
+  for ("what is producing the pose").
+- **`state` is the source's own state string**, verbatim: `MAPPING`,
+  `LOCALIZING`, `SOURCE_UP`, `IDLE`. It used to be nav's `"global_costmap"` /
+  `"no_global_map"`, which described nav rather than the pose source. Read
+  `GridMap.available` on `map/grid` for "is there a raster".
+- **`quality` is populated** for the first time. MOLA has had the localization
+  quality all along; nav had no way to know it.
+- **`map_id` is the active session in either SLAM mode.** `state` is what
+  separates them, and it matters: a coordinate stored while `state` is
+  `MAPPING` is anchored to a frame still being optimised, and a save or a loop
+  closure moves it without the session name changing.
+
+**It is latched and beats about every 5 s.** `RobotClient.map_id(within=30.0)`
+keeps working unchanged — the beat is deliberately the rate nav republished at,
+so the default keeps its margin. The beat is not a keep-alive for a latched
+key; it is what makes the age of this one mean "the pose source is still
+there". `map/grid` is change-only for exactly that reason: a grid's age says
+nothing.
+
+Running on the odometry fallback instead of MOLA, nothing publishes this key at
+all — and that silence is the right answer, because odometry has no map.
+
+### The SLAM map is on the bus, and it is latched for real
+
+New topic `map/grid` carrying `GridMap`, published by the MOLA control plane
+itself. Reading the deployment's map no longer means calling MOLA's HTTP API:
+subscribe and the current map arrives on subscribe, because this is the first
+key on the stack whose producer participates in zenoh-ext advanced pub/sub.
+Everything above about `latched=True` being intent rather than a guarantee
+still holds for the other keys — this one is the exception, and the pattern the
+rest will follow.
+
+- **It is the raw grid, not `NavTopics.costmap_global`.** That key carries the
+  same map already inflated by *this robot's* radius, which is the wrong input
+  for anyone who is not this robot. `GridMap` is what SLAM built.
+- **The raster travels as a PNG** (base64, one atomic message with its
+  georeference) — a hall-sized grid is a couple of kilobytes this way and
+  hundreds as a cell list. `GridMap.png_bytes()` decodes it; `probability()`,
+  `is_occupied()` and `is_free()` apply the `map_server` threshold rule,
+  `negate` included.
+- **Row 0 is the top of the image**, not the bottom like `CostMap`. Flip
+  vertically when converting between the two, or the building comes out
+  mirrored.
+- **Published on change only** — a rebuilt grid, or a different session going
+  live — and never on a timer. So an old `stamp` here is normal and says
+  nothing about whether SLAM is alive; `localization/pose` answers that.
+- **Two things can be missing independently.** `map_id` is `None` when the
+  deployment is operating in no map at all; `image_png` is empty when no grid
+  has been built for that session yet, which is the normal state during
+  mapping. `available` is the pair of them.
+
 ### Map identity, and the coordinates it keeps honest
 
 New topic `localization/map_identity` carrying `MapIdentity`, in the new

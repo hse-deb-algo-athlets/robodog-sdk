@@ -42,7 +42,7 @@ from .navigation import (
     normalize_angle,
     quaternion_to_yaw,
 )
-from .occupancy import FREE, INSCRIBED, LETHAL, CostMap
+from .occupancy import FREE, INSCRIBED, LETHAL, CostMap, GridMap
 from .robot import (
     BatteryLevel,
     BatteryState,
@@ -90,6 +90,7 @@ __all__ = [
     "GamepadState",
     "GamepadStatus",
     "GatewayAction",
+    "GridMap",
     "Headline",
     "IMUState",
     "Location",
