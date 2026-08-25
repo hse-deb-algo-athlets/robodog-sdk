@@ -5,6 +5,26 @@ Semantic versioning; `0.x` minor versions may move keys.
 
 ## [Unreleased]
 
+### A tilt that stays
+
+`RobotClient.tilt()` sends one frame, and the robot relaxes out of it within
+about 200 ms — a posture had to be pumped by hand. Added:
+
+- `hold_tilt(pitch_deg, roll_deg, yaw_deg, *, rate_hz)` — keeps a setpoint and
+  re-asserts it until it is changed or cleared. Repeated calls retarget the
+  running pump rather than starting a second one.
+- `clear_tilt()` — levels the robot with a single frame, then stops publishing.
+  Nothing is sent while the setpoint is zero.
+- `tilting(...)` — the scoped form, restoring the previous hold on exit.
+- `tilt_setpoint` — the orientation currently being held.
+
+Leaving a `RobotClient` block now levels the body as well as halting, and
+`FakeStack` records commanded orientations in `tilts` / `last_tilt`.
+
+Nothing was removed and `tilt()` is unchanged. Note that the tilt key does not
+pass through the motion gateway, so a held posture is neither arbitrated nor
+covered by the collision monitor — see `docs/driving.md`.
+
 ## [0.2.0] - 2026-08-23
 
 ### The contract now says what the stack actually does

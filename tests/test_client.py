@@ -149,6 +149,81 @@ async def test_action_and_estop_are_published() -> None:
         assert event.seq == 1
 
 
+async def test_held_tilt_is_reasserted_then_goes_quiet_when_level() -> None:
+    async with harness() as h:
+        agent, stack = await _agent_with_stack(h)
+
+        agent.robot.hold_tilt(pitch_deg=10.0, rate_hz=20.0)
+        await asyncio.sleep(0.3)
+        held = len(stack.tilts)
+        assert held > 3, "hold_tilt() should re-assert the posture, not fire once"
+        assert all(t.pitch_deg == 10.0 for t in stack.tilts)
+
+        agent.robot.clear_tilt()
+        await asyncio.sleep(0.3)
+        assert stack.last_tilt is not None and stack.last_tilt.is_zero(), (
+            "clearing must level the robot explicitly, not merely stop asserting"
+        )
+        assert len(stack.tilts) <= held + 2, "a level robot must not be published to"
+
+
+async def test_holding_a_tilt_retargets_rather_than_stacking_pumps() -> None:
+    async with harness() as h:
+        agent, stack = await _agent_with_stack(h)
+
+        agent.robot.hold_tilt(pitch_deg=5.0, rate_hz=20.0)
+        await asyncio.sleep(0.2)
+        agent.robot.hold_tilt(pitch_deg=-5.0, roll_deg=3.0, rate_hz=20.0)
+        await asyncio.sleep(0.2)
+
+        assert agent.robot.tilt_setpoint.pitch_deg == -5.0
+        assert stack.last_tilt is not None and stack.last_tilt.roll_deg == 3.0
+        # Two pumps would roughly double the rate; one retargeted pump does not.
+        assert len(stack.tilts) < 20, "hold_tilt() must not start a second pump"
+
+        agent.robot.clear_tilt()
+
+
+async def test_tilting_block_restores_the_previous_hold() -> None:
+    async with harness() as h:
+        agent, stack = await _agent_with_stack(h)
+
+        agent.robot.hold_tilt(pitch_deg=8.0, rate_hz=20.0)
+        async with agent.robot.tilting(roll_deg=4.0):
+            await asyncio.sleep(0.15)
+            assert agent.robot.tilt_setpoint.roll_deg == 4.0
+            assert agent.robot.tilt_setpoint.pitch_deg == 0.0
+
+        await asyncio.sleep(0.15)
+        assert agent.robot.tilt_setpoint.pitch_deg == 8.0, "the outer hold must survive the block"
+        assert stack.last_tilt is not None and stack.last_tilt.pitch_deg == 8.0
+
+        agent.robot.clear_tilt()
+
+
+async def test_an_out_of_range_hold_raises_in_the_caller() -> None:
+    async with harness() as h:
+        agent, stack = await _agent_with_stack(h)
+
+        with pytest.raises(ValidationError):
+            agent.robot.hold_tilt(pitch_deg=90.0)
+
+        await asyncio.sleep(0.15)
+        assert not stack.tilts, "a rejected setpoint must never reach the robot"
+
+
+async def test_leaving_the_client_levels_the_robot() -> None:
+    async with harness() as h:
+        agent, stack = await _agent_with_stack(h)
+
+        async with agent.robot as robot:
+            robot.hold_tilt(pitch_deg=10.0, rate_hz=20.0)
+            await asyncio.sleep(0.2)
+
+        await asyncio.sleep(0.2)
+        assert stack.last_tilt is not None and stack.last_tilt.is_zero()
+
+
 async def test_repeated_stops_are_distinguishable_from_a_resend() -> None:
     """Consumers deduplicate on ``(source_id, seq)``, so two deliberate stops
     must not look like one press delivered twice."""
