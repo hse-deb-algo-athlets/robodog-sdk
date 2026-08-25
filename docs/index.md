@@ -40,7 +40,7 @@ and the packaging decision: ADR-010 in the robodog-digipro repository.
 ## Install
 
 ```bash
-uv add "robodog-sdk @ git+https://github.com/hse-deb-algo-athlets/robodog-sdk@v0.2.0"
+uv add "robodog-sdk @ git+https://github.com/hse-deb-algo-athlets/robodog-sdk@v0.2.1"
 ```
 
 Two dependencies (`zenode`, `pydantic`), no hardware or simulation packages.
@@ -48,7 +48,7 @@ It installs on any laptop in seconds. The optional `livox` extra adds CDR
 point-cloud decoding for the externally-produced `livox/lidar` topic:
 
 ```bash
-uv add "robodog-sdk[livox] @ git+https://github.com/hse-deb-algo-athlets/robodog-sdk@v0.2.0"
+uv add "robodog-sdk[livox] @ git+https://github.com/hse-deb-algo-athlets/robodog-sdk@v0.2.1"
 ```
 
 ## A first node

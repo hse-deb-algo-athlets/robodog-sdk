@@ -5,6 +5,8 @@ Semantic versioning; `0.x` minor versions may move keys.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-25
+
 ### A tilt that stays
 
 `RobotClient.tilt()` sends one frame, and the robot relaxes out of it within
