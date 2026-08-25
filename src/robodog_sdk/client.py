@@ -69,6 +69,13 @@ T = TypeVar("T")
 #: ``COMMAND_MAX_AGE``, so a dropped sample does not interrupt motion.
 DRIVE_RATE_HZ = 10.0
 
+#: Default re-assert rate for :meth:`RobotClient.hold_tilt`, in Hz. Unlike
+#: :data:`DRIVE_RATE_HZ` this is not set by ``COMMAND_MAX_AGE`` — the tilt key
+#: carries no max age — but by the robot: a body orientation is applied for a
+#: single control frame and relaxes back to neutral in roughly 0.2 s, so a
+#: posture that stays has to be re-asserted faster than that.
+TILT_RATE_HZ = 10.0
+
 #: Seconds to wait for the navigation coordinator to answer a submit or a
 #: cancel. Generous, because a preempting submit answers only once the
 #: displaced task has actually stopped.
@@ -197,6 +204,9 @@ class RobotClient:
         self._action = node.publisher(PoseTopics.action)
         self._tilt = node.publisher(PoseTopics.tilt_body)
         self._cancel_seq = 0
+        self._tilt_setpoint = TiltBody()
+        self._tilt_period = 1.0 / TILT_RATE_HZ
+        self._tilt_pump: asyncio.Task[None] | None = None
 
         node.subscribe(StateTopics.odometry, self.state.odometry.update, mode="latest")
         node.subscribe(LocalizationTopics.pose, self.state.localization.update, mode="latest")
@@ -404,8 +414,108 @@ class RobotClient:
         self._action.put(ActionCommand(action=action))
 
     def tilt(self, pitch_deg: float = 0.0, roll_deg: float = 0.0, yaw_deg: float = 0.0) -> None:
-        """Set body orientation while standing, in degrees."""
+        """Set body orientation while standing, in degrees.
+
+        One frame. The robot applies it for a single control cycle and relaxes
+        back to neutral within about 0.2 s, so this is a nudge, not a posture —
+        use :meth:`hold_tilt` for one that stays.
+        """
         self._tilt.put(TiltBody(pitch_deg=pitch_deg, roll_deg=roll_deg, yaw_deg=yaw_deg))
+
+    def hold_tilt(
+        self,
+        pitch_deg: float = 0.0,
+        roll_deg: float = 0.0,
+        yaw_deg: float = 0.0,
+        *,
+        rate_hz: float = TILT_RATE_HZ,
+    ) -> None:
+        """Hold a body orientation until it is changed or cleared.
+
+        Re-asserts the setpoint at ``rate_hz`` from a background task, because
+        a single :meth:`tilt` decays on the robot::
+
+            robot.hold_tilt(pitch_deg=10.0)   # leans, and keeps leaning
+            ...
+            robot.clear_tilt()                # back to level, and goes quiet
+
+        Calling it again retargets the running pump rather than starting a
+        second one, so sweeping an angle is just repeated calls. An all-zero
+        setpoint stops the pump and publishes a single levelling frame — one
+        frame rather than none, because a bridge that latches the last
+        orientation would otherwise keep the robot leaning. While level,
+        nothing is published at all.
+
+        Note that this key bypasses the motion gateway: a held tilt is not
+        arbitrated against another source and not covered by the collision
+        monitor or the deadman. Whoever publishes last wins, every frame.
+
+        Args:
+            pitch_deg: Nose up positive.
+            roll_deg: Right side down positive.
+            yaw_deg: Counter-clockwise positive.
+            rate_hz: Re-assert rate. Takes effect on the pump's next pass.
+
+        Raises:
+            pydantic.ValidationError: A value lies outside
+                :mod:`robodog_sdk.limits`. Raised in the caller rather than
+                inside the pump, where it would only kill the task.
+        """
+        setpoint = TiltBody(pitch_deg=pitch_deg, roll_deg=roll_deg, yaw_deg=yaw_deg)
+        self._tilt_setpoint = setpoint
+        self._tilt_period = 1.0 / rate_hz
+        if setpoint.is_zero():
+            self._stop_tilt_pump()
+            self._tilt.put(setpoint)
+            return
+        if self._tilt_pump is None or self._tilt_pump.done():
+            self._tilt_pump = self._node.spawn(self._pump_tilt(), name="tilt")
+
+    def clear_tilt(self) -> None:
+        """Return the body to level and stop publishing."""
+        self.hold_tilt()
+
+    @property
+    def tilt_setpoint(self) -> TiltBody:
+        """The orientation currently being held. ``is_zero()`` when none is."""
+        return self._tilt_setpoint
+
+    @contextlib.asynccontextmanager
+    async def tilting(
+        self, pitch_deg: float = 0.0, roll_deg: float = 0.0, yaw_deg: float = 0.0
+    ) -> AsyncIterator[None]:
+        """Hold an orientation for the duration of the block.
+
+        Restores the *previous* setpoint on exit, including on exception —
+        so nesting this inside a standing hold returns to that hold rather than
+        to level.
+
+        Args:
+            pitch_deg: Nose up positive.
+            roll_deg: Right side down positive.
+            yaw_deg: Counter-clockwise positive.
+        """
+        previous = self._tilt_setpoint
+        self.hold_tilt(pitch_deg, roll_deg, yaw_deg)
+        try:
+            yield
+        finally:
+            self.hold_tilt(previous.pitch_deg, previous.roll_deg, previous.yaw_deg)
+
+    async def _pump_tilt(self) -> None:
+        # Reads the setpoint and the period on every pass, so retargeting
+        # mid-hold neither restarts the task nor drops a frame.
+        while True:
+            self._tilt.put(self._tilt_setpoint)
+            await asyncio.sleep(self._tilt_period)
+
+    def _stop_tilt_pump(self) -> None:
+        # Cancelled without awaiting, since the callers are synchronous.
+        # ``node.spawn`` checks for cancellation in its done callback, so this
+        # leaves no unretrieved exception behind.
+        if self._tilt_pump is not None:
+            self._tilt_pump.cancel()
+            self._tilt_pump = None
 
     def emergency_stop(self) -> None:
         """Stop the robot now, and abandon whatever it was doing.
@@ -775,3 +885,6 @@ class RobotClient:
         tb: TracebackType | None,
     ) -> None:
         self.halt()
+        # A posture outliving the client that asked for it is as surprising as
+        # a velocity would be, so the lean goes with the block.
+        self.clear_tilt()

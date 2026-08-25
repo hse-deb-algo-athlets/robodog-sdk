@@ -33,6 +33,7 @@ from .msgs.motion import (
     MotionGatewayStatus,
     MovementCommand,
     MovementSource,
+    TiltBody,
 )
 from .msgs.navigation import (
     CancelAck,
@@ -56,6 +57,7 @@ from .topics import (
     LocalizationTopics,
     MotionTopics,
     NavServices,
+    PoseTopics,
     SafetyTopics,
     StateTopics,
     task_feedback_topic,
@@ -239,10 +241,16 @@ class FakeStack(Node):
     #: records it rather than acting on it, so a test can assert that a node
     #: asked for the stop without the double having to model the recovery.
     cancels: list[ButtonEvent]
+    #: Every ``TiltBody`` seen on the pose key, in order. The double records
+    #: the stream; it does not model the robot relaxing out of a posture
+    #: between frames, which is the very thing
+    #: :meth:`~robodog_sdk.RobotClient.hold_tilt` exists to prevent.
+    tilts: list[TiltBody]
 
     async def on_start(self) -> None:
         self.commands = []
         self.cancels = []
+        self.tilts = []
         self.odometry.put(OdometryState())
         self.localization.put(OdometryState())
         self.map_identity.put(MapIdentity(map_id="fake-map", source="fake-stack", reachable=True))
@@ -261,6 +269,10 @@ class FakeStack(Node):
     @subscribe(SafetyTopics.cancel)
     async def on_cancel_button(self, msg: ButtonEvent) -> None:
         self.cancels.append(msg)
+
+    @subscribe(PoseTopics.tilt_body)
+    async def on_tilt_body(self, msg: TiltBody) -> None:
+        self.tilts.append(msg)
 
     def set_pose(self, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> None:
         """Publish a new pose, on both the odometry and localization keys.
@@ -362,6 +374,11 @@ class FakeStack(Node):
     def last_command(self) -> MovementCommand | None:
         """The most recent command on the inlet, if any."""
         return self.commands[-1] if self.commands else None
+
+    @property
+    def last_tilt(self) -> TiltBody | None:
+        """The most recent body orientation commanded, if any."""
+        return self.tilts[-1] if self.tilts else None
 
     @property
     def stopped(self) -> bool:

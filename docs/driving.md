@@ -35,6 +35,34 @@ yourself.
 
 Age is measured across hosts, so it requires synchronized clocks (NTP/chrony).
 
+## So do postures, for a different reason
+
+`robot.tilt(pitch_deg=10)` leans the body for about 200 ms and then relaxes.
+That is not the deadman — the tilt key carries no `max_age` — it is the robot:
+a body orientation is applied for one control frame and neutralises on its own.
+
+`robot.hold_tilt(...)` is the one that stays. It keeps a setpoint and
+re-asserts it at 10 Hz until you change or clear it:
+
+```python
+# leans, and keeps leaning
+robot.hold_tilt(pitch_deg=10.0)
+# retargets the same pump, no second one
+robot.hold_tilt(pitch_deg=-5.0)
+# levels, then goes quiet
+robot.clear_tilt()
+```
+
+While the setpoint is zero nothing is published at all — clearing sends one
+levelling frame and stops, rather than streaming zeros at a robot that is
+already level. `robot.tilting(...)` is the scoped version, and it restores the
+previous hold on the way out rather than levelling.
+
+The tilt key does **not** go through the motion gateway, so a held tilt is not
+arbitrated against another source and not covered by the collision monitor or
+the deadman: whoever publishes last wins, on every frame. Two nodes holding
+different postures will fight silently at 10 Hz.
+
 ## Velocities are bounded
 
 {class}`~robodog_sdk.msgs.motion.MovementCommand` enforces the robot's
